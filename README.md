@@ -7,8 +7,8 @@ Every tool in this repository is **self-contained, hand-written and
 home-grown**. No frameworks, no bloat — plain Python 3 and Bash, the way
 system tools should be.
 
-> 🔒 **Private tooling.** These tools are built exclusively for GlassyOS and
-> are not intended for public distribution.
+Part of the **GlassyOS** ecosystem — the tools are built for GlassyOS first,
+but every script is standalone and runs on any Arch-based system.
 
 ## 📦 The tools
 
@@ -46,6 +46,10 @@ Plymouth for `glassy-boot-setup`.
 | **glassy-tools** (this repo) | System tooling suite |
 | glassy-lyrics | Synced lyrics as big terminal text (karaoke style) |
 | gaur | GlassyOS AUR helper — paru-compatible, zero-dependency, with malware scan |
+
+## 📄 License
+
+[MIT](LICENSE) © GlassyOS
 
 ---
 
