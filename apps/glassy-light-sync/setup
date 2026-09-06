@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+#
+# glassy-light-sync — setup installer
+#
+# Installs glassy-light-sync from THIS folder onto your system:
+#   1. checks/installs system dependencies (python, numpy, scipy,
+#      portaudio/sounddevice, tinytuya)
+#   2. copies the tool to ~/.local/bin/glassy-light-sync
+#   3. adds ~/.local/bin to your PATH (if missing)
+#   4. creates a tinytuya.json from the example (if none exists)
+#   5. verifies the install, prints next steps, then DELETES ITSELF
+#
+# Usage:  bash setup     (or:  ./setup)   — run from inside the folder
+# Flags:  -y / --yes     assume yes for all prompts (non-interactive)
+# Env:    SETUP_SKIP_SYSTEM=1   skip package-manager steps (dev/testing only)
+#
+set -u
+
+VERSION="13.0"
+FLAG_YES=0
+for a in "$@"; do
+  case "$a" in
+    -y|--yes) FLAG_YES=1 ;;
+    -h|--help)
+      sed -n '2,16p' "$0"
+      exit 0 ;;
+    *) echo "unknown option: $a (only -y/--yes is supported)" >&2; exit 2 ;;
+  esac
+done
+
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+HERE="$(cd "$(dirname "$SELF_PATH")" && pwd)"
+TOOL_SRC="$HERE/glassy-light-sync"
+CFG_EXAMPLE="$HERE/tinytuya.example.json"
+CFG_DEST="$HOME/.config/glassy-light-sync/tinytuya.json"
+
+# ── colors (only when tty) ────────────────────────────────────────────────
+if [ -t 1 ]; then
+  C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_B="\033[1m"; C_0="\033[0m"
+else
+  C_G=""; C_Y=""; C_R=""; C_B=""; C_0=""
+fi
+ok()   { printf "${C_G}  ✔${C_0} %s\n" "$*"; }
+warn() { printf "${C_Y}  ⚠${C_0} %s\n" "$*"; }
+fail() { printf "${C_R}  ✖${C_0} %s\n" "$*"; }
+step() { printf "\n${C_B}== %s ==${C_0}\n" "$*"; }
+
+confirm() { # $1 = question; default yes
+  if [ "$FLAG_YES" = 1 ]; then
+    printf "${C_B}?${C_0} %s [Y/n] -> y\n" "$1"
+    return 0
+  fi
+  printf "${C_B}?${C_0} %s [Y/n] " "$1"
+  local ans
+  IFS= read -r ans || true
+  case "${ans:-y}" in
+    [yY]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+banner() {
+  cat <<'EOF'
+
+    ██████╗ ██╗     ███████╗██╗   ██╗███████╗██████╗
+   ██╔════╝ ██║     ██╔════╝╚██╗ ██╔╝██╔════╝██╔══██╗
+   ██║  ███╗██║     █████╗   ╚████╔╝ █████╗  ██████╔╝
+   ██║   ██║██║     ██╔══╝    ╚██╔╝  ██╔══╝  ██╔══██╗
+   ╚██████╔╝███████╗███████╗   ██║   ███████╗██║  ██║
+    ╚═════╝ ╚══════╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+EOF
+  printf "  ${C_B}light-sync — setup installer v%s${C_0}\n\n" "$VERSION"
+}
+
+# ── detection ─────────────────────────────────────────────────────────────
+detect_pm() {
+  if command -v pacman >/dev/null 2>&1; then PM="pacman"
+  elif command -v apt-get >/dev/null 2>&1; then PM="apt"
+  elif command -v dnf >/dev/null 2>&1; then PM="dnf"
+  else PM=""
+  fi
+}
+
+pm_pkgs() { # $1 = what (python|numpy|scipy|portaudio|pip)
+  case "$PM:$1" in
+    pacman:python)    echo "python" ;;
+    pacman:numpy)     echo "python-numpy" ;;
+    pacman:scipy)     echo "python-scipy" ;;
+    pacman:portaudio) echo "portaudio" ;;
+    pacman:pip)       echo "python-pip" ;;
+    apt:python)       echo "python3" ;;
+    apt:numpy)        echo "python3-numpy" ;;
+    apt:scipy)        echo "python3-scipy" ;;
+    apt:portaudio)    echo "portaudio19-dev" ;;
+    apt:pip)          echo "python3-pip" ;;
+    dnf:python)       echo "python3" ;;
+    dnf:numpy)        echo "python3-numpy" ;;
+    dnf:scipy)        echo "python3-scipy" ;;
+    dnf:portaudio)    echo "portaudio-devel" ;;
+    dnf:pip)          echo "python3-pip" ;;
+    *)                echo "" ;;
+  esac
+}
+
+pm_install() { # pkgs...
+  case "$PM" in
+    pacman) sudo -n true 2>/dev/null && sudo pacman -S --needed --noconfirm "$@" || sudo pacman -S --needed "$@" ;;
+    apt)    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    dnf)    sudo dnf install -y "$@" ;;
+  esac
+}
+
+has_pip() { python3 -m pip --version >/dev/null 2>&1; }
+
+pip_user_install() {
+  python3 -m pip install --user --quiet "$1" 2>/dev/null \
+    || python3 -m pip install --user --quiet --break-system-packages "$1" 2>/dev/null \
+    || return 1
+}
+
+import_ok() { python3 -c "import $1" >/dev/null 2>&1; }
+
+# ── main ──────────────────────────────────────────────────────────────────
+main() {
+  banner
+  echo "This installer sets up glassy-light-sync from this folder:"
+  echo "  • system packages if missing (python, numpy, scipy, portaudio, pip)"
+  echo "  • python modules sounddevice + tinytuya (pip --user fallback)"
+  echo "  • copies glassy-light-sync → ~/.local/bin/glassy-light-sync"
+  echo "  • prepares ~/.config/glassy-light-sync/tinytuya.json (you fill in keys)"
+  echo "On success this file deletes itself."
+  echo
+
+  # --- 0. sanity -----------------------------------------------------------
+  if [ ! -f "$TOOL_SRC" ]; then
+    fail "glassy-light-sync not found next to this installer."
+    echo "  Expected: $TOOL_SRC"
+    exit 1
+  fi
+  if [ "$(uname -s)" != "Linux" ]; then
+    fail "glassy-light-sync is built for Linux (ALSA/PulseAudio)."
+    exit 1
+  fi
+  detect_pm
+  [ -n "$PM" ] && ok "package manager detected: $PM" || warn "no pacman/apt/dnf found — system packages must be installed manually"
+
+  # --- 1. system packages --------------------------------------------------
+  step "System dependencies"
+  NEED=""
+  command -v python3 >/dev/null 2>&1 || NEED="$NEED $(pm_pkgs python)"
+  import_ok numpy || NEED="$NEED $(pm_pkgs numpy)"
+  import_ok scipy || NEED="$NEED $(pm_pkgs scipy)"
+  has_pip || NEED="$NEED $(pm_pkgs pip)"
+  # portaudio is needed by sounddevice; detect via ldconfig or pkg-config
+  if ! pkg-config --exists portaudio-2.0 2>/dev/null && ! ldconfig -p 2>/dev/null | grep -q "libportaudio"; then
+    NEED="$NEED $(pm_pkgs portaudio)"
+  fi
+
+  if [ -n "$NEED" ]; then
+    if [ "${SETUP_SKIP_SYSTEM:-0}" = "1" ]; then
+      warn "SETUP_SKIP_SYSTEM=1 — skipping system packages (dev mode)"
+      warn "  still missing:${NEED}"
+    elif [ -z "$PM" ]; then
+      fail "missing system packages, but no supported package manager found."
+      echo "  Please install manually, then re-run this installer:"
+      echo "    python3, numpy, scipy, portaudio"
+      exit 1
+    else
+      echo "The following system packages are missing:${NEED}"
+      if confirm "Install them now (needs sudo)?"; then
+        if [ "$(id -u)" = "0" ]; then
+          pm_install $NEED || { fail "package install failed"; exit 1; }
+        elif command -v sudo >/dev/null 2>&1; then
+          echo "  (sudo may ask for your password)"
+          sudo -v || { fail "sudo failed — cannot install system packages"; exit 1; }
+          pm_install $NEED || { fail "package install failed"; exit 1; }
+        else
+          fail "not root and no sudo available — install manually:"
+          echo "    ${PM:+your package manager: }${NEED}"
+          exit 1
+        fi
+        ok "system packages installed"
+      else
+        warn "skipped — audio analysis will not work without numpy/scipy/portaudio"
+      fi
+    fi
+  else
+    ok "python3, numpy, scipy, portaudio, pip — all present"
+  fi
+
+  # --- 2. python modules via pip --------------------------------------------
+  step "Python modules (sounddevice, tinytuya)"
+  MISSING_PIP=""
+  import_ok sounddevice || MISSING_PIP="$MISSING_PIP sounddevice"
+  import_ok tinytuya || MISSING_PIP="$MISSING_PIP tinytuya"
+  if [ -n "$MISSING_PIP" ]; then
+    if has_pip; then
+      if confirm "Install via pip --user:${MISSING_PIP}?"; then
+        for m in $MISSING_PIP; do
+          pip_user_install "$m" && ok "installed $m" || fail "could not install $m"
+        done
+      fi
+    else
+      warn "pip missing — install sounddevice + tinytuya manually, e.g.:"
+      echo "    sudo pacman -S python-pip && pip install --user sounddevice tinytuya"
+    fi
+  else
+    ok "sounddevice + tinytuya already present"
+  fi
+
+  # --- 3. install the tool ---------------------------------------------------
+  step "Installing glassy-light-sync"
+  BIN_DIR="$HOME/.local/bin"
+  CFG_DIR="$HOME/.config/glassy-light-sync"
+  mkdir -p "$BIN_DIR" "$CFG_DIR"
+
+  DEST="$BIN_DIR/glassy-light-sync"
+  cp "$TOOL_SRC" "$DEST"
+  chmod +x "$DEST"
+  ok "installed to $DEST ($(wc -l < "$DEST") lines)"
+
+  # --- 4. config --------------------------------------------------------------
+  if [ ! -f "$CFG_DEST" ]; then
+    step "Tuya config"
+    if [ -f "$CFG_EXAMPLE" ]; then
+      cp "$CFG_EXAMPLE" "$CFG_DEST"
+      ok "created $CFG_DEST"
+      warn "open it and fill in your Tuya IoT credentials + device IDs!"
+      echo "  - apiKey/apiSecret: Tuya IoT Platform (iot.tuya.com)"
+      echo "  - gatewayDeviceId:  your Zigbee gateway ID"
+      echo "  - stripDeviceId:    your RGB strip ID"
+      echo "  Test first with: glassy-light-sync --dry-run"
+    else
+      warn "tinytuya.example.json not found — create $CFG_DEST manually"
+    fi
+  else
+    ok "config already exists: $CFG_DEST"
+  fi
+
+  # --- 5. PATH ----------------------------------------------------------------
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) : ;;
+    *)
+      RC="$HOME/.bashrc"
+      case "${SHELL:-/bin/bash}" in
+        *zsh) RC="$HOME/.zshrc" ;;
+      esac
+      if ! grep -qF "export PATH=\"\$HOME/.local/bin" "$RC" 2>/dev/null; then
+        printf '\n# added by glassy-light-sync setup\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+        ok "added ~/.local/bin to PATH in $RC"
+        echo "  → open a new terminal (or: source $RC) before running glassy-light-sync"
+      fi
+      ;;
+  esac
+
+  # --- 6. verify + cleanup ----------------------------------------------------
+  step "Verification"
+  if [ -x "$DEST" ]; then
+    ok "glassy-light-sync is installed and executable"
+    echo
+    echo "  Next steps:"
+    echo "    1. edit $CFG_DEST (add Tuya credentials)"
+    echo "    2. glassy-light-sync --list-mics   → find your mic index"
+    echo "    3. glassy-light-sync --mic N --dry-run   → test without hardware"
+    echo "    4. glassy-light-sync --mic N   → go! (be quiet for 2 s calibration)"
+    echo
+    if [ "$FLAG_YES" = 1 ]; then
+      rm -f "$0"
+    else
+      if confirm "Delete this installer file?"; then
+        rm -f "$0"
+      else
+        warn "leaving installer in place — you can delete it later"
+      fi
+    fi
+  else
+    fail "install verification failed — copy manually:"
+    echo "  install -m755 \"$TOOL_SRC\" ~/.local/bin/glassy-light-sync"
+    exit 1
+  fi
+}
+
+main

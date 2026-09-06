@@ -1,16 +1,23 @@
 # glassy-tools 🛠️
 
-The system tooling suite of **GlassyOS** — a Linux distribution built on top of
+The tool suite of **GlassyOS** — a Linux distribution built on top of
 Arch Linux, designed to be beautiful, safe and low-maintenance.
 
-Every tool in this repository is **self-contained, hand-written and
-home-grown**. No frameworks, no bloat — plain Python 3 and Bash, the way
-system tools should be.
+Everything here is **self-contained, hand-written and home-grown**. No
+frameworks, no bloat — plain Python 3 and Bash, the way system tools should
+be. Two areas live in this repository:
 
-Part of the **GlassyOS** ecosystem — the tools are built for GlassyOS first,
-but every script is standalone and runs on any Arch-based system.
+| Area | Contents |
+|---|---|
+| [`bin/`](#system-tools) | System tools — update, health, security, installer & more |
+| [`apps/`](#glassvibe-apps) | **GlassVibe** apps — full user-facing tools with their own setup installer |
 
-## 📦 The tools
+---
+
+## System tools (`bin/`)
+
+Everyday system tooling — install by copying `bin/glassy-*` into your PATH
+(`~/.local/bin`) or run them directly.
 
 | Tool | Language | What it does |
 |---|---|---|
@@ -28,23 +35,57 @@ but every script is standalone and runs on any Arch-based system.
 | `glassy-splash` | Python | Animated GOS logo, shown at Hyprland startup |
 | `glassy-flex` | Bash | Tiled multi-TUI flex display on a dedicated workspace (3×2 grid) |
 
-## 🚀 Install
+Install:
 
 ```bash
-# copy the tools into your PATH
 install -m755 bin/glassy-* ~/.local/bin/
 ```
 
-Requirements depend on the tool — Python 3 for the Python tools, GTK4 +
-libadwaita for `glassy-onboard`, ClamAV for `glassy-checkup`/`glassy-secure`,
-Plymouth for `glassy-boot-setup`.
+---
 
-## 🏗️ Part of the GlassyOS ecosystem
+## GlassVibe apps (`apps/`)
+
+The user-facing **GlassVibe** tools. Each app lives in its own folder with a
+complete `setup` installer (checks dependencies, installs to
+`~/.local/bin`, creates config, deletes itself).
+
+### 🎤 glassy-lyrics — synced lyrics as big terminal text
+
+Karaoke-style lyrics in your terminal: every word is rendered through Pillow
+into a bitmap and drawn with half-block characters (`█ ▀ ▄`) — ASCII, ß,
+Hangul, accents and emoji all look the same. Works with **any** MPRIS-capable
+player (Spotify, VLC, mpv, …) via playerctl.
+
+```bash
+cd apps/glassy-lyrics
+bash setup        # or: ./setup
+```
+
+### 🎵💡 glassy-light-sync — music-reactive RGB lighting
+
+Syncs a Tuya Cloud RGB(W) strip to music picked up by your microphone (FFT
+analysis, v13 auto-calibration engine). Reacts to relative volume changes
+above your measured noise floor; dims the strip when music stops.
+
+```bash
+cd apps/glassy-light-sync
+bash setup        # or: ./setup
+# then fill in your Tuya credentials:
+nano ~/.config/glassy-light-sync/tinytuya.json
+glassy-light-sync --list-mics
+glassy-light-sync --mic 2 --dry-run   # test without hardware
+```
+
+> 🔒 The real `tinytuya.json` is git-ignored — `tinytuya.example.json` is the
+> public template. Never commit your Tuya keys.
+
+---
+
+## 🏗️ GlassyOS ecosystem
 
 | Project | Description |
 |---|---|
-| **glassy-tools** (this repo) | System tooling suite |
-| glassy-lyrics | Synced lyrics as big terminal text (karaoke style) |
+| **glassy-tools** (this repo) | System tools + GlassVibe apps |
 | gaur | GlassyOS AUR helper — paru-compatible, zero-dependency, with malware scan |
 
 ## 📄 License

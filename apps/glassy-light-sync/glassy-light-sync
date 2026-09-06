@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+glassy-light-sync — music-reactive RGB light sync (v13 engine, auto-calibration)
+=================================================================================
+
+Reacts to music picked up by a microphone and drives a Tuya Cloud RGB(W)
+strip/gateway in sync with the beat. Instead of absolute levels it measures
+the *silence baseline* at startup (2 s of quiet) and reacts to *relative*
+changes — so even cheap or auto-gained microphones work reliably.
+
+Core idea (v13):
+  - Auto-calibrate: measure silence level for CALIBRATION_SEC seconds
+  - Only relative changes above THRESHOLD_MULTIPLIER × baseline trigger colors
+  - Strip dims automatically when the music stops
+
+Part of the GlassyOS tool suite. Originally developed as "Kim Music Sync".
+"""
+
+import argparse
+import json
+import random
+import signal
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import sounddevice as sd
+from scipy.fft import rfft, rfftfreq
+
+# Tuya
+try:
+    import tinytuya
+    HAS_TUYA = True
+except ImportError:
+    HAS_TUYA = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_SAMPLE_RATE = 44100
+DEFAULT_BLOCK_DURATION = 0.05
+
+# Device IDs come from the credentials file (tinytuya.json) — see example file.
+STRIP_DEVICE_ID = ""
+GATEWAY_DEVICE_ID = ""
+
+BASS_RANGE = (20, 250)
+MID_RANGE = (250, 2000)
+HIGH_RANGE = (2000, 8000)
+
+VAL_MIN = 30
+VAL_MAX = 255
+
+SMOOTHING_FACTOR = 0.3
+
+# Auto-calibration
+CALIBRATION_SEC = 2.0       # seconds of silence to measure
+THRESHOLD_MULTIPLIER = 2.5  # threshold = baseline * 2.5
+SILENCE_TIMEOUT = 1.5       # seconds until silence is detected
+
+COLOR_PALETTE = [
+    (0, 255), (15, 255), (30, 255), (45, 255), (60, 255), (75, 255),
+    (90, 255), (105, 255), (120, 255), (135, 255), (150, 255), (165, 255),
+    (180, 255), (195, 255), (210, 255), (225, 255), (240, 255), (255, 255),
+    (270, 255), (285, 255), (300, 255), (315, 255), (330, 255), (345, 255),
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+running = True
+
+def handle_sig(sig, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGINT, handle_sig)
+signal.signal(signal.SIGTERM, handle_sig)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TUYA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TuyaController:
+    def __init__(self, credentials_path, dry_run=False):
+        self.dry_run = dry_run
+        self.last_send = 0.0
+        self.cloud = None
+        self.is_silent = True
+
+        if dry_run:
+            print("[DRY-RUN] No Tuya commands will be sent.")
+            return
+
+        if not HAS_TUYA:
+            print("[ERROR] tinytuya is not installed!"); sys.exit(1)
+
+        cred_file = Path(credentials_path)
+        if not cred_file.exists():
+            cred_file = Path(__file__).parent / "tinytuya.json"
+        if not cred_file.exists():
+            raise FileNotFoundError(f"credentials file not found: {credentials_path}")
+
+        with open(cred_file, "r") as f:
+            cred = json.load(f)
+
+        self.strip_id = cred.get("stripDeviceId", STRIP_DEVICE_ID)
+        gateway_id = cred.get("gatewayDeviceId",
+                              cred.get("apiDeviceID", GATEWAY_DEVICE_ID))
+        if not self.strip_id or not gateway_id:
+            raise ValueError(
+                "tinytuya.json must contain 'gatewayDeviceId' and 'stripDeviceId' "
+                "(copy tinytuya.example.json and fill in your Tuya device IDs)."
+            )
+
+        self.cloud = tinytuya.Cloud(
+            apiRegion=cred.get("apiRegion", cred.get("region", "eu")),
+            apiKey=cred.get("apiKey", cred.get("key", "")),
+            apiSecret=cred.get("apiSecret", cred.get("secret", "")),
+            apiDeviceID=gateway_id
+        )
+        print("[OK] Connected to Tuya Cloud.")
+
+    def send_colour(self, hue, saturation, value):
+        now = time.time()
+        if now - self.last_send < 0.25:
+            return False
+        self.last_send = now
+        self.is_silent = False
+
+        if self.dry_run:
+            print(f"[COLOR] 🎵 HSV({hue:3d},{saturation:3d},{value:3d})")
+            return True
+
+        tuya_h = max(0, min(360, int(hue)))
+        tuya_s = max(0, min(1000, int(saturation / 255 * 1000)))
+        tuya_v = max(0, min(1000, int(value / 255 * 1000)))
+
+        commands = {
+            "commands": [
+                {"code": "work_mode", "value": "colour"},
+                {"code": "colour_data_v2", "value": {"h": tuya_h, "s": tuya_s, "v": tuya_v}}
+            ]
+        }
+
+        try:
+            result = self.cloud.sendcommand(self.strip_id, commands)
+            if result.get("success"):
+                print(f"[SENT] 🎵 HSV({hue:3d},{saturation:3d},{value:3d})")
+                return True
+            else:
+                print(f"[FAIL] Tuya: {result}")
+                return False
+        except Exception as e:
+            print(f"[ERROR] Tuya: {e}")
+            return False
+
+    def send_silence(self):
+        if self.is_silent:
+            return
+        self.is_silent = True
+
+        now = time.time()
+        if now - self.last_send < 0.25:
+            return
+        self.last_send = now
+
+        if self.dry_run:
+            print("[SILENCE] Strip would dim...")
+            return
+
+        try:
+            self.cloud.sendcommand(self.strip_id, {
+                "commands": [
+                    {"code": "work_mode", "value": "colour"},
+                    {"code": "colour_data_v2", "value": {"h": 0, "s": 0, "v": 50}}
+                ]
+            })
+            print("[SILENCE] Strip dimmed")
+        except Exception as e:
+            print(f"[ERROR] Silence: {e}")
+
+    def set_white(self, brightness, temperature):
+        if self.dry_run:
+            print(f"[DRY-RUN] White: {brightness}/{temperature}")
+            return
+        commands = {
+            "commands": [
+                {"code": "work_mode", "value": "white"},
+                {"code": "bright_value_v2", "value": max(10, min(1000, brightness))},
+                {"code": "temp_value_v2", "value": max(0, min(1000, temperature))}
+            ]
+        }
+        try:
+            self.cloud.sendcommand(self.strip_id, commands)
+        except:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUDIO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def list_microphones():
+    print("\nAvailable microphones:")
+    print("-" * 60)
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0:
+            marker = "  <--" if i == sd.default.device[0] else ""
+            print(f"  [{i}] {dev['name']}{marker}")
+    print("-" * 60)
+    print(f"Default microphone: {sd.default.device[0]}\n")
+
+
+def analyze_audio_block(audio_block, sample_rate):
+    if audio_block.ndim > 1:
+        audio = np.mean(audio_block, axis=1)
+    else:
+        audio = audio_block
+
+    rms = np.sqrt(np.mean(audio ** 2))
+    volume = min(1.0, rms * 4.0)
+
+    n = len(audio)
+    fft_vals = np.abs(rfft(audio))
+    freqs = rfftfreq(n, 1.0 / sample_rate)
+
+    def band_energy(low, high):
+        mask = (freqs >= low) & (freqs < high)
+        if not np.any(mask):
+            return 0.0
+        return np.sum(fft_vals[mask] ** 2)
+
+    bass_raw = band_energy(*BASS_RANGE)
+    mid_raw = band_energy(*MID_RANGE)
+    high_raw = band_energy(*HIGH_RANGE)
+    total_raw = bass_raw + mid_raw + high_raw + 1e-10
+
+    bass = min(1.0, bass_raw / (total_raw * 0.4 + 1e-10))
+    mid = min(1.0, mid_raw / (total_raw * 0.4 + 1e-10))
+    high = min(1.0, high_raw / (total_raw * 0.4 + 1e-10))
+
+    return {"volume": volume, "bass": bass, "mid": mid, "high": high}
+
+
+def smooth_ema(new_val, old_ema, alpha=SMOOTHING_FACTOR):
+    return alpha * new_val + (1 - alpha) * old_ema
+
+
+def pick_random_color():
+    hue, sat = random.choice(COLOR_PALETTE)
+    hue = (hue + random.randint(-15, 15)) % 360
+    sat = min(255, max(100, sat + random.randint(-30, 30)))
+    return hue, sat
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_music_sync(args):
+    global running
+
+    print("\n" + "=" * 70)
+    print("  🎵  glassy-light-sync v13 — auto-calibration")
+    print("=" * 70)
+    print("  IMPORTANT: Be quiet now! Calibrating the microphone...")
+    print("=" * 70 + "\n")
+
+    print("[INFO] Connecting to Tuya Cloud...")
+    try:
+        tuya = TuyaController(args.credentials, dry_run=args.dry_run)
+    except Exception as e:
+        print(f"[ERROR] Tuya: {e}")
+        sys.exit(1)
+
+    # Audio buffer for calibration
+    calibration_buffer = []
+
+    def calib_callback(indata, frames, time_info, status):
+        if status:
+            print(f"[AUDIO] {status}")
+        calibration_buffer.append(indata.copy())
+
+    print("[INFO] Starting audio stream for calibration...")
+    block_size = int(DEFAULT_BLOCK_DURATION * DEFAULT_SAMPLE_RATE)
+    try:
+        stream = sd.InputStream(
+            device=args.mic,
+            channels=1,
+            samplerate=DEFAULT_SAMPLE_RATE,
+            blocksize=block_size,
+            callback=calib_callback
+        )
+        stream.start()
+    except Exception as e:
+        print(f"[ERROR] Audio: {e}")
+        list_microphones()
+        sys.exit(1)
+
+    # CALIBRATION: measure 2 seconds of silence
+    print(f"[INFO] Calibrating... (be quiet for {CALIBRATION_SEC}s)")
+    time.sleep(CALIBRATION_SEC)
+
+    if len(calibration_buffer) == 0:
+        print("[ERROR] No audio data received!")
+        stream.stop()
+        stream.close()
+        sys.exit(1)
+
+    # Baseline calculation
+    volumes = []
+    for block in calibration_buffer:
+        features = analyze_audio_block(block, DEFAULT_SAMPLE_RATE)
+        volumes.append(features["volume"])
+
+    baseline = np.mean(volumes)
+    baseline_max = np.max(volumes)
+    threshold = baseline * THRESHOLD_MULTIPLIER
+
+    print("[OK] Calibration complete!")
+    print(f"     Baseline: {baseline:.4f}")
+    print(f"     Max:      {baseline_max:.4f}")
+    print(f"     Threshold: {threshold:.4f} (baseline * {THRESHOLD_MULTIPLIER})")
+
+    if baseline > 0.5:
+        print(f"\n[WARNING] Baseline is very high ({baseline:.4f})!")
+        print("           The microphone is probably overdriven.")
+        print("           Check: alsamixer or pavucontrol")
+        print("           Try: --mic INDEX to pick another device")
+
+    print()
+
+    # Main loop
+    ema_bass = 0.0
+    ema_mid = 0.0
+    ema_high = 0.0
+    ema_volume = 0.0
+
+    last_loud_time = time.time()
+    is_silent = True
+
+    audio_buffer = []
+
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            print(f"[AUDIO] {status}")
+        audio_buffer.append(indata.copy())
+
+    # Restart stream with main callback
+    stream.stop()
+    stream.close()
+
+    stream = sd.InputStream(
+        device=args.mic,
+        channels=1,
+        samplerate=DEFAULT_SAMPLE_RATE,
+        blocksize=block_size,
+        callback=audio_callback
+    )
+    stream.start()
+
+    print("[OK] Audio running. Waiting for music...\n")
+
+    last_debug = time.time()
+
+    try:
+        while running:
+            if len(audio_buffer) == 0:
+                time.sleep(0.01)
+                continue
+
+            audio_block = audio_buffer[-1]
+            audio_buffer.clear()
+
+            features = analyze_audio_block(audio_block, DEFAULT_SAMPLE_RATE)
+
+            ema_bass = smooth_ema(features["bass"], ema_bass)
+            ema_mid = smooth_ema(features["mid"], ema_mid)
+            ema_high = smooth_ema(features["high"], ema_high)
+            ema_volume = smooth_ema(features["volume"], ema_volume)
+
+            now = time.time()
+
+            # RELATIVE to baseline!
+            if ema_volume > threshold:
+                # MUSIC! (relative to silence)
+                last_loud_time = now
+
+                if is_silent:
+                    print("[MUSIC] Detected! Sending color...")
+                    is_silent = False
+
+                hue, sat = pick_random_color()
+                val = int(VAL_MIN + ema_volume * (VAL_MAX - VAL_MIN))
+                val = min(VAL_MAX, max(VAL_MIN, val))
+                tuya.send_colour(hue, sat, val)
+
+            else:
+                # QUIET (below threshold)
+                if not is_silent and (now - last_loud_time) > SILENCE_TIMEOUT:
+                    print("[SILENCE] No music anymore. Dimming strip...")
+                    tuya.send_silence()
+                    is_silent = True
+
+            now = time.time()
+            if now - last_debug > 2.0:
+                status = "MUSIC" if not is_silent else "SILENT"
+                print(f"[{status}] Vol:{ema_volume:.2f} (Thresh:{threshold:.2f}) | "
+                      f"B:{ema_bass:.2f} M:{ema_mid:.2f} H:{ema_high:.2f}")
+                last_debug = now
+
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+
+    finally:
+        running = False
+        print("\n[INFO] Stopping...")
+        stream.stop()
+        stream.close()
+        tuya.set_white(brightness=300, temperature=0)
+        print("[OK] Bye! 👋\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="🎵 glassy-light-sync v13 — music-reactive RGB lights (Tuya Cloud)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --dry-run     # test without Tuya
+  %(prog)s --mic 2       # use a specific microphone
+  %(prog)s --list-mics   # list input devices
+
+IMPORTANT:
+  - At startup: BE QUIET for 2 seconds (auto-calibration)!
+  - The script measures the silence level and only reacts to relative changes
+  - If baseline > 0.5: the microphone is overdriven - lower the gain
+        """
+    )
+
+    parser.add_argument("--mic", "-m", type=int, default=None,
+                        help="microphone index")
+    parser.add_argument("--credentials", "-c", default="tinytuya.json",
+                        help="path to tinytuya.json")
+    parser.add_argument("--dry-run", "-d", action="store_true",
+                        help="do not send Tuya commands")
+    parser.add_argument("--list-mics", "-l", action="store_true",
+                        help="list microphones")
+
+    args = parser.parse_args()
+
+    if args.list_mics:
+        list_microphones()
+        sys.exit(0)
+
+    run_music_sync(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+{
+    "apiRegion": "eu",
+    "apiKey": "YOUR_TUYA_API_KEY",
+    "apiSecret": "YOUR_TUYA_API_SECRET",
+    "gatewayDeviceId": "YOUR_GATEWAY_DEVICE_ID",
+    "stripDeviceId": "YOUR_STRIP_DEVICE_ID"
+}

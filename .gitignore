@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# never commit real Tuya credentials!
+apps/glassy-light-sync/tinytuya.json
