@@ -1,11 +1,19 @@
-# glassy-tools 🛠️
+# glasstools 🛠️
 
-The tool suite of **GlassyOS** — a Linux distribution built on top of
-Arch Linux, designed to be beautiful, safe and low-maintenance.
+The **closed system tooling of GlassyOS** — a Linux distribution built on top
+of Arch Linux, designed to be beautiful, safe and low-maintenance.
+
+> 🔒 **Made exclusively for GlassyOS.** Everything in this repository is a
+> **closed, tightly integrated part of the GlassyOS ecosystem** — built
+> specifically for GlassyOS, around its architecture, its lifecycle and its
+> philosophy. These are **not** generic public utilities: they are private
+> systems of the distribution, engineered to work together as one unit. The
+> source is public to show the craft behind GlassyOS — but every tool is
+> designed for GlassyOS first and only.
 
 Everything here is **self-contained, hand-written and home-grown**. No
 frameworks, no bloat — plain Python 3 and Bash, the way system tools should
-be. Two areas live in this repository:
+be. Two closed areas live in this repository:
 
 | Area | Contents |
 |---|---|
@@ -16,8 +24,9 @@ be. Two areas live in this repository:
 
 ## System tools (`bin/`)
 
-Everyday system tooling — install by copying `bin/glassy-*` into your PATH
-(`~/.local/bin`) or run them directly.
+The everyday system layer of GlassyOS — exclusive GlassyOS tooling that
+ships with the distribution. Install by copying `bin/glassy-*` into your
+PATH (`~/.local/bin`) or run them directly.
 
 | Tool | Language | What it does |
 |---|---|---|
@@ -45,8 +54,8 @@ install -m755 bin/glassy-* ~/.local/bin/
 
 ## GlassVibe apps (`apps/`)
 
-The user-facing **GlassVibe** tools. Each app lives in its own folder with a
-complete `setup` installer (checks dependencies, installs to
+**GlassVibe** — the closed app layer of GlassyOS. Each app lives in its own
+folder with a complete `setup` installer (checks dependencies, installs to
 `~/.local/bin`, creates config, deletes itself).
 
 ### 🎤 glassy-lyrics — synced lyrics as big terminal text
@@ -85,7 +94,7 @@ glassy-light-sync --mic 2 --dry-run   # test without hardware
 
 | Project | Description |
 |---|---|
-| **glassy-tools** (this repo) | System tools + GlassVibe apps |
+| **glasstools** (this repo) | The closed system tools + GlassVibe apps of GlassyOS |
 | gaur | GlassyOS AUR helper — paru-compatible, zero-dependency, with malware scan |
 
 ## 📄 License
