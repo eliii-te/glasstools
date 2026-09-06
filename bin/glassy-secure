@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# glassy-secure — real-time download folder scanner for glassyOS
+# Watches ~/Downloads with inotify; scans new files with ClamAV;
+# auto-quarantines threats. Runs as user systemd service.
+
+set -euo pipefail
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'; C_RED=$'\033[31m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""
+fi
+log()   { printf "%s[secure]%s %s\n" "$C_CYAN"   "$C_RESET" "$*" >&2; }
+ok()    { printf "%s[ok]%s %s\n"     "$C_GREEN"  "$C_RESET" "$*" >&2; }
+warn()  { printf "%s[warn]%s %s\n"   "$C_YELLOW" "$C_RESET" "$*" >&2; }
+alert() { printf "%s[!!]%s %s\n"     "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; }
+
+GLASSY_HOME="$HOME/.local/share/glassy"
+QUARANTINE="$GLASSY_HOME/quarantine"
+QUARANTINE_LOG="$QUARANTINE/quarantine.log"
+LOG="$GLASSY_HOME/logs/secure.log"
+WATCH_DIRS=("$HOME/Downloads")
+SERVICE_FILE="$HOME/.config/systemd/user/glassy-secure.service"
+
+mkdir -p "$QUARANTINE" "$(dirname "$LOG")" "$(dirname "$SERVICE_FILE")"
+
+case "${1:-}" in
+  -h|--help|"")
+    cat <<EOF
+${C_BOLD}glassy-secure${C_RESET} — real-time download scanner
+
+  glassy-secure install    set up as user-systemd service
+  glassy-secure start      start the watcher
+  glassy-secure stop       stop the watcher
+  glassy-secure status     show status + recent log
+  glassy-secure watch      run interactively in this terminal (debug)
+  glassy-secure uninstall  remove the service
+
+default watch path: ${WATCH_DIRS[*]}
+EOF
+    [[ -z "${1:-}" ]] && exit 0 || exit 0 ;;
+esac
+
+quarantine() {
+  local f="$1" reason="$2"
+  local id; id=$(date +%s)-$(basename "$f" | tr -c 'a-zA-Z0-9' '_')
+  local dest="$QUARANTINE/$id"
+  if mv "$f" "$dest" 2>/dev/null; then
+    chmod 000 "$dest"
+    printf "%s\t%s\t%s\t%s\n" "$(date -Iseconds)" "$reason" "$f" "$id" >> "$QUARANTINE_LOG"
+    alert "QUARANTINE: $f (reason: $reason)"
+    command -v notify-send >/dev/null && notify-send -u critical \
+      "Glassy Secure: threat blocked" "$(basename "$f")\n$reason\nMoved to quarantine."
+    echo "$(date -Iseconds) QUARANTINE $f reason=$reason" >> "$LOG"
+    return 0
+  fi
+  return 1
+}
+
+scan_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  case "$f" in *.part|*.crdownload|*.tmp) return 0 ;; esac
+  sleep 1
+  [[ -f "$f" ]] || return 0
+
+  echo "$(date -Iseconds) SCAN $f" >> "$LOG"
+
+  # ClamAV check
+  if command -v clamscan >/dev/null; then
+    local result
+    result=$(clamscan --no-summary --infected "$f" 2>/dev/null | head -1 || true)
+    if [[ "$result" == *FOUND* ]]; then
+      local sig="${result##*: }"; sig="${sig% FOUND}"
+      quarantine "$f" "clamav:$sig"
+      return
+    fi
+  fi
+
+  # Heuristic: warn on executable installers (don't auto-quarantine — legit case)
+  if [[ -x "$f" ]]; then
+    case "$f" in
+      *.sh|*.bin|*.run|*.AppImage|*.deb|*.rpm)
+        warn "executable downloaded: $f"
+        command -v notify-send >/dev/null && notify-send -u normal \
+          "Glassy Secure" "Executable file downloaded:\n$(basename "$f")\nScan first with: glassy-checkup \"$f\""
+        echo "$(date -Iseconds) WARN-EXEC $f" >> "$LOG"
+        ;;
+    esac
+  fi
+
+  # MIME mismatch: executable disguised as media
+  if command -v file >/dev/null; then
+    local ftype; ftype=$(file -b --mime-type "$f" 2>/dev/null || echo "")
+    case "${f,,}" in
+      *.jpg|*.jpeg|*.png|*.gif|*.mp4|*.mp3|*.pdf|*.docx)
+        case "$ftype" in
+          image/*|video/*|audio/*|application/pdf|application/zip|application/*officedocument*) ;;
+          application/x-executable|application/x-sharedlib|application/x-dosexec)
+            quarantine "$f" "disguised executable with media extension"
+            return ;;
+          *) warn "MIME mismatch: $f is $ftype" ;;
+        esac
+        ;;
+    esac
+  fi
+}
+
+run_watcher() {
+  command -v inotifywait >/dev/null || { warn "inotify-tools missing"; sudo pacman -S --needed inotify-tools; }
+  command -v clamscan    >/dev/null || warn "ClamAV missing — heuristics only (install: sudo pacman -S clamav)"
+  for d in "${WATCH_DIRS[@]}"; do mkdir -p "$d"; done
+  log "watching: ${WATCH_DIRS[*]}"
+  echo "$(date -Iseconds) STARTED watching ${WATCH_DIRS[*]}" >> "$LOG"
+
+  inotifywait -m -e close_write -e moved_to --format '%w%f' "${WATCH_DIRS[@]}" | \
+  while IFS= read -r file; do
+    scan_file "$file" &
+  done
+}
+
+install_service() {
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Glassy Secure — real-time download scanner
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/glassy-secure watch
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now glassy-secure.service
+  ok "Glassy Secure is now running in the background"
+  log "status: glassy-secure status"
+  log "log:    $LOG"
+}
+
+case "${1:-}" in
+  install)    install_service ;;
+  start)      systemctl --user start glassy-secure.service && ok "started" ;;
+  stop)       systemctl --user stop  glassy-secure.service && ok "stopped" ;;
+  status)
+    systemctl --user status glassy-secure.service --no-pager 2>/dev/null || warn "service not installed"
+    echo; log "recent log entries:"
+    tail -20 "$LOG" 2>/dev/null || log "(no log yet)"
+    ;;
+  watch)      run_watcher ;;
+  uninstall)
+    systemctl --user disable --now glassy-secure.service 2>/dev/null || true
+    rm -f "$SERVICE_FILE"
+    systemctl --user daemon-reload
+    ok "uninstalled"
+    ;;
+  *) log "unknown: $1"; exit 1 ;;
+esac

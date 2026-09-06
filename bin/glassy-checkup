@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# glassy-checkup — malware & integrity scanner for glassyOS
+# Uses ClamAV + rkhunter + heuristic checks. Supports quarantine.
+
+set -euo pipefail
+
+# ─── UI ────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'; C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""; C_DIM=""
+fi
+log()    { printf "%s[glassy]%s %s\n"    "$C_CYAN"   "$C_RESET" "$*" >&2; }
+step()   { printf "\n%s▸ %s%s\n"          "$C_BOLD"  "$*" "$C_RESET" >&2; }
+ok()     { printf "%s[ok]%s %s\n"         "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn()   { printf "%s[warn]%s %s\n"       "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()    { printf "%s[error]%s %s\n"      "$C_RED"   "$C_RESET" "$*" >&2; }
+alert()  { printf "%s[!ALERT!]%s %s\n"    "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; }
+
+GLASSY_HOME="$HOME/.local/share/glassy"
+QUARANTINE="$GLASSY_HOME/quarantine"
+LOG_DIR="$GLASSY_HOME/logs"
+QUARANTINE_LOG="$QUARANTINE/quarantine.log"
+mkdir -p "$QUARANTINE" "$LOG_DIR"
+
+# ─── Subcommands ───────────────────────────────────────────────────────
+show_quarantine() {
+  step "Quarantine — blocked files"
+  if [[ ! -s "$QUARANTINE_LOG" ]]; then
+    ok "no files in quarantine"
+    return
+  fi
+  printf "%-25s  %-20s  %-45s  %s\n" "Date" "Reason" "Original path" "Quarantine-ID"
+  printf '%.0s─' {1..110}; echo
+  column -t -s $'\t' "$QUARANTINE_LOG" 2>/dev/null || cat "$QUARANTINE_LOG"
+  echo
+  log "files stored unreadable (chmod 000) in: $QUARANTINE"
+  log "restore:        glassy-checkup --restore <ID>"
+  log "delete for good: glassy-checkup --purge-quarantine"
+}
+
+restore_from_quarantine() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err "please provide an ID: glassy-checkup --restore <ID>"; exit 1; }
+  local qfile="$QUARANTINE/$id"
+  if [[ ! -f "$qfile" ]]; then
+    err "no file with ID '$id' found"
+    exit 1
+  fi
+  local orig
+  orig=$(awk -F'\t' -v id="$id" '$4==id {print $3; exit}' "$QUARANTINE_LOG")
+  [[ -z "$orig" ]] && orig="$HOME/restored-$id"
+  warn "restoring: $qfile → $orig"
+  read -rp "sure? this file was flagged as a threat! [y/N] " r
+  [[ "$r" =~ ^[Yy]$ ]] || { log "cancelled"; exit 0; }
+  chmod 644 "$qfile"
+  mv "$qfile" "$orig"
+  grep -v -F "	$id" "$QUARANTINE_LOG" > "$QUARANTINE_LOG.tmp" && mv "$QUARANTINE_LOG.tmp" "$QUARANTINE_LOG"
+  ok "restored: $orig"
+}
+
+purge_quarantine() {
+  warn "ALL quarantined files will be permanently deleted!"
+  read -rp "really? type 'purge' to confirm: " r
+  [[ "$r" == "purge" ]] || { log "cancelled"; exit 0; }
+  rm -rf "$QUARANTINE"/*
+  > "$QUARANTINE_LOG"
+  ok "quarantine emptied"
+}
+
+quarantine_file() {
+  local file="$1"
+  local reason="$2"
+  local id
+  id=$(date +%s)-$(basename "$file" | tr -c 'a-zA-Z0-9' '_')
+  local qfile="$QUARANTINE/$id"
+  if mv "$file" "$qfile" 2>/dev/null || sudo mv "$file" "$qfile" 2>/dev/null; then
+    chmod 000 "$qfile" 2>/dev/null || sudo chmod 000 "$qfile"
+    printf "%s\t%s\t%s\t%s\n" "$(date -Iseconds)" "$reason" "$file" "$id" >> "$QUARANTINE_LOG"
+    alert "QUARANTINE: $file (reason: $reason, ID: $id)"
+    return 0
+  else
+    err "couldn't move to quarantine: $file"
+    return 1
+  fi
+}
+
+# ─── CLI args ──────────────────────────────────────────────────────────
+SCAN_PATH=""
+MODE="standard"  # quick | standard | full | custom
+case "${1:-}" in
+  -h|--help)
+    cat <<EOF
+${C_BOLD}glassy-checkup${C_RESET} — malware & integrity scanner
+
+${C_BOLD}Scan modes:${C_RESET}
+  glassy-checkup --quick         fast (~30s): ~/Downloads + ~/.local/bin + /tmp
+                                   heuristic only, no ClamAV/rkhunter
+  glassy-checkup                 standard (few min): full \$HOME + common sys paths
+                                   heuristic + ClamAV + rkhunter
+  glassy-checkup --full          thorough (hours): entire filesystem
+                                   heuristic + ClamAV on / + rkhunter + paccheck
+  glassy-checkup <path>          custom: scan only this path (heuristic+ClamAV)
+
+${C_BOLD}Quarantine:${C_RESET}
+  glassy-checkup --quarantine    show all blocked files
+  glassy-checkup --restore <ID>  restore a file
+  glassy-checkup --purge-quarantine   delete all quarantined files for good
+
+${C_BOLD}Signatures:${C_RESET}
+  glassy-checkup --update        update ClamAV + rkhunter databases
+EOF
+    exit 0 ;;
+  --quarantine|--quarantene)  show_quarantine; exit 0 ;;
+  --restore)                  restore_from_quarantine "${2:-}"; exit 0 ;;
+  --purge-quarantine)         purge_quarantine; exit 0 ;;
+  --test)
+    step "quarantine system test"
+    test_file="$HOME/Downloads/glassy-eicar-test.com"
+    # EICAR is the internationally recognized AV test string — completely harmless.
+    # All AV software detects it as a test. ClamAV reports it as Eicar-Signature.
+    printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\n' > "$test_file"
+    ok "created EICAR test file: $test_file"
+    log "(this is the standard AV test string — recognized by all scanners, 100%% harmless)"
+    quarantine_file "$test_file" "test:eicar-trigger"
+    echo
+    ok "quarantine system works!"
+    log "check:   glassy-checkup --quarantine"
+    log "restore: glassy-checkup --restore <ID>"
+    log "delete:  glassy-checkup --purge-quarantine"
+    exit 0 ;;
+  --update)                   MODE="update" ;;
+  --quick)                    MODE="quick" ;;
+  --full)                     MODE="full" ;;
+  "")                         ;;
+  -*)                         err "unknown option: $1"; exit 1 ;;
+  *)                          MODE="custom"; SCAN_PATH="$1" ;;
+esac
+
+# ─── Dependency setup ──────────────────────────────────────────────────
+ensure_deps() {
+  local need_clamav=1 need_rkhunter=1
+  [[ "$MODE" == "quick" ]] && { need_clamav=0; need_rkhunter=0; }
+
+  local missing=()
+  (( need_clamav ))   && ! command -v clamscan >/dev/null && missing+=(clamav)
+  (( need_rkhunter )) && ! command -v rkhunter >/dev/null && missing+=(rkhunter)
+
+  if (( ${#missing[@]} > 0 )); then
+    warn "missing tools for this scan mode: ${missing[*]}"
+    read -rp "install now? [Y/n] " r
+    if [[ ! "$r" =~ ^[Nn]$ ]]; then
+      sudo pacman -S --needed "${missing[@]}"
+      if systemctl list-unit-files clamav-freshclam.service >/dev/null 2>&1; then
+        sudo systemctl enable --now clamav-freshclam.service || true
+      fi
+      log "downloading initial ClamAV signatures (may take 1–2 min)…"
+      sudo freshclam 2>/dev/null || warn "freshclam failed — retry later"
+    else
+      warn "continuing without these tools (results will be limited)"
+    fi
+  fi
+}
+
+update_sigs() {
+  step "signature update"
+  command -v freshclam >/dev/null && sudo freshclam
+  command -v rkhunter  >/dev/null && sudo rkhunter --update
+  ok "signatures up to date"
+}
+
+if [[ "$MODE" == "update" ]]; then
+  ensure_deps; update_sigs; exit 0
+fi
+
+ensure_deps
+
+# ─── Mode → targets + heuristic depth ──────────────────────────────────
+# Each mode defines:
+#   CLAM_TARGETS     what clamscan recurses over
+#   HEUR_SUID_PATHS  where to hunt for suspicious SUID
+#   HEUR_TMP_PATHS   where to hunt for executables in writable temp
+#   HEUR_HOME_SCAN   1/0: look for hidden executables in $HOME
+#   RUN_CLAMAV       1/0
+#   RUN_RKHUNTER     1/0
+#   RUN_PACCHECK     1/0 (full system-wide package integrity)
+
+case "$MODE" in
+  quick)
+    CLAM_TARGETS=("$HOME/Downloads" "$HOME/.local/bin" "/tmp")
+    HEUR_SUID_PATHS=("/tmp" "/var/tmp")
+    HEUR_TMP_PATHS=("/tmp")
+    HEUR_HOME_SCAN=0
+    RUN_CLAMAV=0
+    RUN_RKHUNTER=0
+    RUN_PACCHECK=0
+    SCAN_LABEL="quick"
+    ;;
+  standard)
+    CLAM_TARGETS=("$HOME" "/tmp" "/var/tmp" "/usr/local/bin" "/etc/cron.d" "/etc/cron.daily")
+    HEUR_SUID_PATHS=("/tmp" "/var/tmp" "/home" "/opt")
+    HEUR_TMP_PATHS=("/tmp" "/var/tmp" "/dev/shm")
+    HEUR_HOME_SCAN=1
+    RUN_CLAMAV=1
+    RUN_RKHUNTER=1
+    RUN_PACCHECK=0
+    SCAN_LABEL="standard"
+    ;;
+  full)
+    CLAM_TARGETS=("/")
+    HEUR_SUID_PATHS=("/")
+    HEUR_TMP_PATHS=("/tmp" "/var/tmp" "/dev/shm")
+    HEUR_HOME_SCAN=1
+    RUN_CLAMAV=1
+    RUN_RKHUNTER=1
+    RUN_PACCHECK=1
+    SCAN_LABEL="full"
+    ;;
+  custom)
+    CLAM_TARGETS=("$SCAN_PATH")
+    HEUR_SUID_PATHS=("$SCAN_PATH")
+    HEUR_TMP_PATHS=()
+    HEUR_HOME_SCAN=0
+    RUN_CLAMAV=1
+    RUN_RKHUNTER=0
+    RUN_PACCHECK=0
+    SCAN_LABEL="custom: $SCAN_PATH"
+    ;;
+esac
+
+step "scan mode: ${C_BOLD}$SCAN_LABEL${C_RESET}"
+log "clamav targets:   ${CLAM_TARGETS[*]}"
+log "heuristic depth:  suid=${HEUR_SUID_PATHS[*]:-none}  tmp-exec=${HEUR_TMP_PATHS[*]:-none}  home=$HEUR_HOME_SCAN"
+log "rkhunter=$RUN_RKHUNTER  paccheck=$RUN_PACCHECK"
+
+FINDINGS_LOG="$LOG_DIR/scan-$(date +%Y%m%d-%H%M%S).log"
+FINDINGS=()
+
+record_finding() {
+  local severity="$1" file="$2" reason="$3"
+  FINDINGS+=("$severity|$file|$reason")
+  printf "[%s] %s: %s — %s\n" "$(date -Iseconds)" "$severity" "$file" "$reason" >> "$FINDINGS_LOG"
+}
+
+# ─── 1. ClamAV ─────────────────────────────────────────────────────────
+scan_clamav() {
+  (( RUN_CLAMAV )) || return 0
+  command -v clamscan >/dev/null || { warn "ClamAV unavailable — skipping"; return; }
+  step "ClamAV virus scan"
+  local tmp; tmp=$(mktemp)
+  clamscan -r -i --no-summary \
+    --exclude-dir='^/proc|^/sys|^/dev|^/run|\.cache/(mozilla|chromium|BraveSoftware)' \
+    "${CLAM_TARGETS[@]}" 2>/dev/null | tee "$tmp" || true
+  while IFS=: read -r file rest; do
+    [[ -z "$file" || "$rest" != *FOUND* ]] && continue
+    local sig="${rest% FOUND}"; sig="${sig# }"
+    record_finding "CRITICAL" "$file" "ClamAV: $sig"
+    alert "virus: $file → $sig"
+    read -rp "quarantine immediately? [Y/n] " r
+    [[ ! "$r" =~ ^[Nn]$ ]] && quarantine_file "$file" "clamav:$sig"
+  done < "$tmp"
+  rm -f "$tmp"
+}
+
+# ─── 2. rkhunter (rootkits) ────────────────────────────────────────────
+scan_rkhunter() {
+  (( RUN_RKHUNTER )) || return 0
+  command -v rkhunter >/dev/null || return 0
+  step "rkhunter rootkit scan"
+  local tmp; tmp=$(mktemp)
+  sudo rkhunter --check --skip-keypress --report-warnings-only --nocolors 2>&1 | tee "$tmp" || true
+  if grep -qE '^Warning:' "$tmp"; then
+    while IFS= read -r line; do
+      record_finding "WARNING" "rkhunter" "$line"
+    done < <(grep -E '^Warning:' "$tmp")
+  else
+    ok "no rootkits found"
+  fi
+  rm -f "$tmp"
+}
+
+# ─── 3. Heuristic checks (depth varies by mode) ────────────────────────
+scan_heuristic() {
+  step "heuristic checks ($SCAN_LABEL depth)"
+
+  # SUID binaries in unusual paths
+  if (( ${#HEUR_SUID_PATHS[@]} > 0 )); then
+    log "→ suspicious SUID binaries in: ${HEUR_SUID_PATHS[*]}"
+    while IFS= read -r f; do
+      record_finding "MEDIUM" "$f" "SUID in user-writable or unusual location"
+      warn "SUID: $f"
+    done < <(find "${HEUR_SUID_PATHS[@]}" -xdev -perm -4000 -type f \
+              -not -path '/usr/*' 2>/dev/null)
+  fi
+
+  # Executables in world-writable temp dirs
+  if (( ${#HEUR_TMP_PATHS[@]} > 0 )); then
+    log "→ executables in: ${HEUR_TMP_PATHS[*]}"
+    while IFS= read -r f; do
+      record_finding "MEDIUM" "$f" "executable in world-writable temp"
+      warn "exec in tmp: $f"
+    done < <(find "${HEUR_TMP_PATHS[@]}" -xdev -perm -u+x -type f 2>/dev/null | head -30)
+  fi
+
+  # Hidden executables in $HOME (standard + full only)
+  if (( HEUR_HOME_SCAN )); then
+    log "→ hidden executables in \$HOME"
+    while IFS= read -r f; do
+      [[ "$f" == *"/.local/bin/"* ]] && continue
+      [[ "$f" == *"/.cargo/"* ]] && continue
+      [[ "$f" == *"/.nvm/"* ]] && continue
+      [[ "$f" == *"/.vscode"* ]] && continue
+      [[ "$f" == *"/node_modules/"* ]] && continue
+      [[ "$f" == *"/.git/"* ]] && continue
+      record_finding "LOW" "$f" "hidden executable in \$HOME"
+    done < <(find "$HOME" -maxdepth 4 -name '.*' -type f -perm -u+x 2>/dev/null | head -20)
+  fi
+
+  # Listening services (all modes)
+  log "→ listening services"
+  if command -v ss >/dev/null; then
+    local unusual
+    unusual=$(ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -vE '127\.0\.0\.1|::1|\*:(22|80|443|631)$' || true)
+    if [[ -n "$unusual" ]]; then
+      warn "unusual listening ports:"
+      echo "$unusual" | sed 's/^/  /'
+    fi
+  fi
+
+  # Cron jobs (standard + full)
+  if [[ "$MODE" != "quick" ]]; then
+    log "→ cron jobs"
+    for f in /etc/cron.d/* /etc/cron.*/* /var/spool/cron/*; do
+      [[ -f "$f" ]] || continue
+      if grep -qE 'wget|curl|base64|eval|\$\(.*\)' "$f" 2>/dev/null; then
+        record_finding "HIGH" "$f" "cron job with suspicious patterns (wget/base64/eval)"
+        warn "suspicious cron: $f"
+      fi
+    done
+  fi
+
+  # User systemd services (standard + full)
+  if [[ "$MODE" != "quick" ]] && [[ -d "$HOME/.config/systemd/user" ]]; then
+    log "→ user systemd services"
+    for s in "$HOME/.config/systemd/user"/*.service; do
+      [[ -f "$s" ]] || continue
+      if grep -qE 'curl.*\|.*(sh|bash)|base64.*-d' "$s" 2>/dev/null; then
+        record_finding "HIGH" "$s" "user-service with pipe-to-shell or base64-decode"
+      fi
+    done
+  fi
+
+  # Recently-modified system binaries (full only)
+  if [[ "$MODE" == "full" ]]; then
+    log "→ system binaries modified in last 7 days"
+    local recent
+    recent=$(find /usr/bin /usr/sbin /usr/local/bin -xdev -type f -mtime -7 2>/dev/null | head -15)
+    if [[ -n "$recent" ]]; then
+      log "(likely from recent update — FYI):"
+      echo "$recent" | sed 's/^/  /'
+    fi
+  fi
+
+  # Package integrity (full only — can be slow)
+  if (( RUN_PACCHECK )) && command -v pacman >/dev/null; then
+    log "→ package integrity (full system-wide paccheck — this takes a while)"
+    if command -v paccheck >/dev/null; then
+      local mods
+      mods=$(paccheck --md5sum --quiet 2>/dev/null | head -10 || true)
+      if [[ -n "$mods" ]]; then
+        warn "system files differing from their package:"
+        echo "$mods" | sed 's/^/  /'
+        while IFS= read -r line; do
+          record_finding "HIGH" "$line" "file differs from package checksum"
+        done <<< "$mods"
+      fi
+    else
+      log "  (install pacman-contrib for 'paccheck')"
+    fi
+  fi
+}
+
+# ─── Run scans ─────────────────────────────────────────────────────────
+scan_heuristic
+scan_clamav
+scan_rkhunter
+
+# ─── Report ────────────────────────────────────────────────────────────
+echo
+step "scan report"
+if (( ${#FINDINGS[@]} == 0 )); then
+  ok "no threats found ✓"
+else
+  crit=0; high=0; med=0; low=0
+  for f in "${FINDINGS[@]}"; do
+    case "${f%%|*}" in
+      CRITICAL) ((crit++)) ;;
+      HIGH)     ((high++)) ;;
+      MEDIUM|WARNING) ((med++)) ;;
+      LOW)      ((low++)) ;;
+    esac
+  done
+  printf "  %s%d CRITICAL%s · %s%d HIGH%s · %s%d MEDIUM%s · %s%d LOW%s\n" \
+    "$C_RED$C_BOLD" "$crit" "$C_RESET" \
+    "$C_RED"       "$high" "$C_RESET" \
+    "$C_YELLOW"    "$med"  "$C_RESET" \
+    "$C_DIM"       "$low"  "$C_RESET"
+  log "full report: $FINDINGS_LOG"
+fi

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# glassy-doctor — system health check + auto-fix for glassyOS
+# Probes Bluetooth, Wi-Fi, PipeWire, Waybar, Hyprland, autostarts, polkit.
+# Tries to start/repair what's broken; reports a summary.
+
+set -uo pipefail
+
+# ─── UI ────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'; C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""; C_DIM=""
+fi
+log()  { printf "%s[doctor]%s %s\n" "$C_CYAN" "$C_RESET" "$*" >&2; }
+step() { printf "\n%s▸ %s%s\n"      "$C_BOLD" "$*" "$C_RESET" >&2; }
+m_ok() { printf "  %s✓%s %s\n"      "$C_GREEN"  "$C_RESET" "$*" >&2; }
+m_fx() { printf "  %s⚒%s %s\n"      "$C_YELLOW" "$C_RESET" "$*" >&2; }
+m_er() { printf "  %s✗%s %s\n"      "$C_RED"    "$C_RESET" "$*" >&2; }
+
+TOTAL=0; OK_N=0; FIX_N=0; FAIL_N=0
+DO_FIX=1
+VERBOSE=0
+
+usage() {
+  cat <<'EOF'
+glassy-doctor — system health check + auto-fix
+
+Usage: glassy-doctor [options]
+
+Options:
+  --no-fix        only diagnose, don't repair
+  -v, --verbose   show extra detail (e.g. last error log lines)
+  -h, --help      this help
+
+Checks: Bluetooth, Wi-Fi (NetworkManager), PipeWire/Wireplumber,
+Waybar, Hyprland, autostart daemons (awww/elephant/walker/dock/
+hypridle/cliphist), Polkit auth agent.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-fix)       DO_FIX=0 ;;
+    -v|--verbose)   VERBOSE=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              echo "unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ $EUID -eq 0 ]]; then
+  log "${C_YELLOW}run as your normal user — user services need the user session.${C_RESET}"
+  exit 1
+fi
+
+mark_ok()   { TOTAL=$((TOTAL+1)); OK_N=$((OK_N+1));   m_ok "$1"; }
+mark_fix()  { TOTAL=$((TOTAL+1)); FIX_N=$((FIX_N+1));  m_fx "$1"; }
+mark_fail() { TOTAL=$((TOTAL+1)); FAIL_N=$((FAIL_N+1)); m_er "$1"; }
+
+# proc check + auto-launch helper.  $1=label  $2=pgrep -f pattern  $3=launch cmd
+check_proc() {
+  local label="$1" pat="$2" cmd="${3:-}"
+  if pgrep -f -- "$pat" >/dev/null 2>&1; then
+    mark_ok "$label running"
+    return
+  fi
+  if [[ $DO_FIX -ne 1 || -z "$cmd" ]]; then
+    mark_fail "$label not running"
+    return
+  fi
+  local bin; bin="${cmd%% *}"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    mark_fail "$label missing (binary '$bin' not installed)"
+    return
+  fi
+  ( setsid bash -c "$cmd" >/dev/null 2>&1 < /dev/null & ) 2>/dev/null
+  sleep 0.5
+  if pgrep -f -- "$pat" >/dev/null 2>&1; then
+    mark_fix "$label started"
+  else
+    mark_fail "$label could not be started"
+  fi
+}
+
+# ─── Bluetooth ─────────────────────────────────────────────────────────
+check_bluetooth() {
+  step "Bluetooth"
+  if ! command -v bluetoothctl >/dev/null; then
+    mark_fail "bluez not installed (skipped)"
+    return
+  fi
+  if systemctl is-active --quiet bluetooth.service; then
+    mark_ok "bluetooth.service active"
+  else
+    if [[ $DO_FIX -eq 1 ]] && sudo systemctl enable --now bluetooth.service 2>/dev/null; then
+      mark_fix "bluetooth.service enabled + started"
+    else
+      mark_fail "bluetooth.service inactive"
+      return
+    fi
+  fi
+  if rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: yes"; then
+    if [[ $DO_FIX -eq 1 ]] && sudo rfkill unblock bluetooth 2>/dev/null; then
+      mark_fix "Bluetooth rfkill-unblocked"
+    else
+      mark_fail "Bluetooth rfkill-blocked"
+    fi
+  fi
+}
+
+# ─── Wi-Fi ─────────────────────────────────────────────────────────────
+check_wifi() {
+  step "Wi-Fi"
+  if ! command -v nmcli >/dev/null; then
+    mark_fail "NetworkManager not installed"
+    return
+  fi
+  if systemctl is-active --quiet NetworkManager; then
+    mark_ok "NetworkManager active"
+  else
+    if [[ $DO_FIX -eq 1 ]] && sudo systemctl enable --now NetworkManager 2>/dev/null; then
+      mark_fix "NetworkManager enabled + started"
+    else
+      mark_fail "NetworkManager inactive"
+      return
+    fi
+  fi
+  if [[ "$(nmcli radio wifi 2>/dev/null)" != "enabled" ]]; then
+    if [[ $DO_FIX -eq 1 ]] && nmcli radio wifi on >/dev/null 2>&1; then
+      mark_fix "Wi-Fi radio turned on"
+    else
+      mark_fail "Wi-Fi radio off"
+    fi
+  else
+    mark_ok "Wi-Fi radio on"
+  fi
+  if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+    if [[ $DO_FIX -eq 1 ]] && sudo rfkill unblock wifi 2>/dev/null; then
+      mark_fix "Wi-Fi rfkill-unblocked"
+    else
+      mark_fail "Wi-Fi rfkill-blocked"
+    fi
+  fi
+}
+
+# ─── PipeWire / Audio ──────────────────────────────────────────────────
+check_audio() {
+  step "PipeWire / Audio"
+  for u in pipewire pipewire-pulse wireplumber; do
+    if systemctl --user is-active --quiet "$u"; then
+      mark_ok "$u active"
+    else
+      if [[ $DO_FIX -eq 1 ]] && systemctl --user enable --now "$u" 2>/dev/null; then
+        mark_fix "$u enabled + started"
+      else
+        mark_fail "$u inactive"
+      fi
+    fi
+  done
+}
+
+# ─── Waybar ────────────────────────────────────────────────────────────
+check_waybar() {
+  step "Waybar"
+  if ! command -v waybar >/dev/null; then
+    mark_fail "waybar not installed"
+    return
+  fi
+  if pgrep -x waybar >/dev/null; then
+    mark_ok "Waybar running"
+    return
+  fi
+  if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+    mark_fail "Waybar not running (no Wayland display, skipping auto-start)"
+    return
+  fi
+  if [[ $DO_FIX -eq 1 ]]; then
+    ( setsid waybar >/dev/null 2>&1 < /dev/null & ) 2>/dev/null
+    sleep 0.6
+    if pgrep -x waybar >/dev/null; then
+      mark_fix "Waybar started"
+    else
+      mark_fail "Waybar could not be started (config error? try: waybar -l debug)"
+    fi
+  else
+    mark_fail "Waybar not running"
+  fi
+}
+
+# ─── Hyprland ──────────────────────────────────────────────────────────
+check_hyprland() {
+  step "Hyprland"
+  if ! pgrep -x Hyprland >/dev/null; then
+    mark_fail "Hyprland process not running"
+    return
+  fi
+  mark_ok "Hyprland process running"
+  if command -v hyprctl >/dev/null && hyprctl version >/dev/null 2>&1; then
+    mark_ok "hyprctl responds"
+  else
+    mark_fail "hyprctl not responding (socket missing?)"
+  fi
+  local logdir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr"
+  if [[ -d "$logdir" ]]; then
+    local last_log
+    last_log=$(find "$logdir" -name "hyprland.log" -printf "%T@ %p\n" 2>/dev/null \
+                 | sort -nr | head -1 | cut -d' ' -f2-)
+    if [[ -n "$last_log" && -f "$last_log" ]]; then
+      local errcnt
+      errcnt=$(grep -ciE "^\[ERR\]|^\[CRIT\]|critical|fatal" "$last_log" 2>/dev/null)
+      errcnt=${errcnt:-0}
+      if (( errcnt > 0 )); then
+        mark_fail "$errcnt error entries in current Hyprland log"
+        if [[ $VERBOSE -eq 1 ]]; then
+          grep -iE "^\[ERR\]|^\[CRIT\]|critical|fatal" "$last_log" | tail -5 \
+            | sed "s/^/    ${C_DIM}/" | sed "s/$/${C_RESET}/"
+        fi
+      else
+        mark_ok "Hyprland log: no errors"
+      fi
+    fi
+  fi
+}
+
+# ─── Autostart daemons ─────────────────────────────────────────────────
+check_autostarts() {
+  step "Autostart daemons"
+  check_proc "awww-daemon"       "awww-daemon"            "awww-daemon"
+  check_proc "elephant"          "(^|/)elephant( |$)"     "elephant"
+  check_proc "walker (service)"  "walker --gapplication"  "walker --gapplication-service"
+  check_proc "nwg-dock-hyprland" "nwg-dock-hyprland"      "nwg-dock-hyprland -p bottom -i 40 -mb 5 -d -hd 0 -c walker -ico view-app-grid-symbolic"
+  check_proc "hypridle"          "(^|/)hypridle( |$)"     "hypridle"
+  check_proc "cliphist (text)"   "wl-paste --type text"   "wl-paste --type text --watch cliphist store"
+  check_proc "cliphist (image)"  "wl-paste --type image"  "wl-paste --type image --watch cliphist store"
+}
+
+# ─── Polkit auth agent ─────────────────────────────────────────────────
+check_polkit() {
+  step "Polkit auth agent"
+  if pgrep -f "polkit-(gnome|kde|mate)-authentication-agent" >/dev/null; then
+    mark_ok "Polkit agent running"
+    return
+  fi
+  local agent="/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1"
+  if [[ $DO_FIX -eq 1 && -x "$agent" ]]; then
+    ( setsid "$agent" >/dev/null 2>&1 < /dev/null & ) 2>/dev/null
+    sleep 0.4
+    if pgrep -f "polkit-gnome-authentication-agent" >/dev/null; then
+      mark_fix "polkit-gnome-agent started"
+    else
+      mark_fail "Polkit agent could not be started"
+    fi
+  else
+    mark_fail "no Polkit agent running (GUI sudo prompts won't work)"
+  fi
+}
+
+# ─── Run ───────────────────────────────────────────────────────────────
+check_bluetooth
+check_wifi
+check_audio
+check_waybar
+check_hyprland
+check_autostarts
+check_polkit
+
+step "Summary"
+printf "  %s✓ OK:    %3d%s\n"  "$C_GREEN"  "$OK_N"   "$C_RESET"
+printf "  %s⚒ Fixed: %3d%s\n"  "$C_YELLOW" "$FIX_N"  "$C_RESET"
+printf "  %s✗ Fail:  %3d%s\n"  "$C_RED"    "$FAIL_N" "$C_RESET"
+printf "  Total:     %3d\n"     "$TOTAL"
+
+echo
+if [[ $FAIL_N -eq 0 && $FIX_N -eq 0 ]]; then
+  m_ok "System healthy."
+  exit 0
+elif [[ $FAIL_N -eq 0 ]]; then
+  m_fx "System healthy after $FIX_N repair(s)."
+  exit 0
+else
+  m_er "$FAIL_N issue(s) unresolved — manual intervention required."
+  exit 1
+fi

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# glassy-flex — open a tiled multi-TUI flex display on a dedicated workspace.
+#
+# Layout (3 columns × 2 rows; middle-bottom split horizontally):
+#
+#   ┌──────────┬──────────┬──────────┐
+#   │  lavat   │ fastfetch│ peaclock │
+#   ├──────────┼──────────┼──────────┤
+#   │ pipes.sh │ unimatrix│  glassy- │
+#   │          ├──────────┤  lyrics  │
+#   │          │   cava   │          │
+#   └──────────┴──────────┴──────────┘
+#
+# Usage:
+#   glassy-flex          open the layout
+#   glassy-flex stop     close all flex windows
+
+set -e
+
+WS=8
+TITLE_PREFIX="glassy-flex-"
+
+# ──── stop mode: close anything tagged with our prefix ────
+if [[ "$1" == "stop" || "$1" == "--close" || "$1" == "-c" ]]; then
+    hyprctl clients -j \
+      | jq -r --arg p "$TITLE_PREFIX" '.[] | select(.title | startswith($p)) | .address' \
+      | while read -r addr; do hyprctl dispatch closewindow "address:$addr" >/dev/null; done
+    exit 0
+fi
+
+command -v hyprctl >/dev/null || { echo "Hyprland not running."; exit 1; }
+command -v jq >/dev/null      || { echo "Need 'jq'."; exit 1; }
+command -v kitty >/dev/null   || { echo "Need 'kitty'."; exit 1; }
+
+# ──── detect focused monitor + reserved (bar) space ────
+eval "$(hyprctl monitors -j \
+  | jq -r '.[] | select(.focused) |
+    "X0=\(.x + .reserved[0]); Y0=\(.y + .reserved[1]); \
+     SW=\(.width - .reserved[0] - .reserved[2]); \
+     SH=\(.height - .reserved[1] - .reserved[3])"')"
+
+# 3-column, 2-row grid; middle-bottom is split into two stacked tiles.
+GAP=6
+COLS=3
+GW=$(( (SW - GAP*(COLS+1)) / COLS ))
+ROWS=2
+GH=$(( (SH - GAP*(ROWS+1)) / ROWS ))
+HALF_H=$(( (GH - GAP) / 2 ))
+
+# Coords (top-left of each cell)
+COL0_X=$(( X0 + GAP ))
+COL1_X=$(( X0 + GAP + GW + GAP ))
+COL2_X=$(( X0 + GAP + 2*(GW + GAP) ))
+ROW0_Y=$(( Y0 + GAP ))
+ROW1_Y=$(( Y0 + GAP + GH + GAP ))
+SPLIT_Y=$(( ROW1_Y + HALF_H + GAP ))
+
+# ──── helper: spawn a kitty tile floating at (x,y,w,h) running cmd ────
+spawn() {
+    local id="$1" x="$2" y="$3" w="$4" h="$5" cmd="$6"
+    local title="${TITLE_PREFIX}${id}"
+    hyprctl --batch "\
+        keyword windowrulev2 float,title:^(${title})$ ;\
+        keyword windowrulev2 size ${w} ${h},title:^(${title})$ ;\
+        keyword windowrulev2 move ${x} ${y},title:^(${title})$ ;\
+        keyword windowrulev2 noborder,title:^(${title})$ ;\
+        keyword windowrulev2 noshadow,title:^(${title})$ ;\
+        keyword windowrulev2 workspace ${WS} silent,title:^(${title})$ ;\
+    " >/dev/null
+
+    setsid kitty \
+        --title="$title" \
+        --override "background_opacity=0.55" \
+        --override "font_size=10" \
+        --override "window_padding_width=8" \
+        --override "confirm_os_window_close=0" \
+        -e bash -c "$cmd; exec bash" \
+        </dev/null >/dev/null 2>&1 &
+    sleep 0.10
+}
+
+# ──── jump to flex workspace ────
+hyprctl dispatch workspace "$WS" >/dev/null
+
+# ──── tiles ────
+spawn lavat       "$COL0_X" "$ROW0_Y" "$GW"  "$GH"      "lavat"
+spawn fastfetch   "$COL1_X" "$ROW0_Y" "$GW"  "$GH"      "while :; do clear; fastfetch; sleep 30; done"
+spawn clock       "$COL2_X" "$ROW0_Y" "$GW"  "$GH"      "peaclock"
+spawn pipes       "$COL0_X" "$ROW1_Y" "$GW"  "$GH"      "pipes.sh -t 7 -p 4 -f 50 -r 4000"
+spawn matrix      "$COL1_X" "$ROW1_Y" "$GW"  "$HALF_H"  "unimatrix -s 95 -f"
+spawn cava        "$COL1_X" "$SPLIT_Y" "$GW" "$HALF_H"  "cava"
+spawn lyrics      "$COL2_X" "$ROW1_Y" "$GW"  "$GH"      "glassy-lyrics"

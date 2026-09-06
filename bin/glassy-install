@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# glassy-install — smart universal installer for glassyOS
+# Searches pacman + AUR + handles git/curl URLs, picks the right install method.
+
+set -euo pipefail
+
+# ─── Colors ────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_BLUE=$'\033[34m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'; C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""; C_DIM=""
+fi
+
+log()  { printf "%s[glassy]%s %s\n" "$C_CYAN" "$C_RESET" "$*" >&2; }
+err()  { printf "%s[error]%s %s\n"  "$C_RED"  "$C_RESET" "$*" >&2; }
+ok()   { printf "%s[ok]%s %s\n"     "$C_GREEN" "$C_RESET" "$*" >&2; }
+
+# ─── Usage ─────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+${C_BOLD}glassy-install${C_RESET} — universal package finder & installer
+
+${C_BOLD}Usage:${C_RESET}
+  glassy-install <query>            search repos + AUR, pick & install
+  glassy-install <github-url>       clone & run install from a repo
+  glassy-install <binary-url>       download binary to ~/.local/bin
+
+${C_BOLD}Examples:${C_RESET}
+  glassy-install AUR helper
+  glassy-install firefox
+  glassy-install https://github.com/user/tool
+  glassy-install https://example.com/tool.tar.gz
+EOF
+}
+
+[[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
+
+QUERY="$*"
+
+# ─── Dep check ─────────────────────────────────────────────────────────
+for cmd in fzf jq curl pacman; do
+  command -v "$cmd" >/dev/null || { err "missing dependency: $cmd"; exit 1; }
+done
+
+AUR_HELPER=""
+for h in paru yay; do
+  command -v "$h" >/dev/null && { AUR_HELPER="$h"; break; }
+done
+
+# ─── URL mode ──────────────────────────────────────────────────────────
+install_from_url() {
+  local url="$1"
+
+  # GitHub repo → clone + try to install
+  if [[ "$url" =~ ^https?://(www\.)?github\.com/[^/]+/[^/]+/?$ ]] \
+     || [[ "$url" =~ ^git@github\.com:.+\.git$ ]]; then
+    local name dest
+    name=$(basename "${url%.git}")
+    dest="$HOME/.local/src/$name"
+    log "cloning $url → $dest"
+    mkdir -p "$HOME/.local/src"
+    if [[ -d "$dest" ]]; then
+      log "already exists, pulling…"
+      git -C "$dest" pull --ff-only
+    else
+      git clone --depth=1 "$url" "$dest"
+    fi
+    cd "$dest"
+    if [[ -f PKGBUILD ]]; then
+      log "found PKGBUILD → makepkg"
+      makepkg -si
+    elif [[ -f Makefile ]] || [[ -f makefile ]]; then
+      log "found Makefile → make && sudo make install"
+      make && sudo make install
+    elif [[ -f install.sh ]]; then
+      log "found install.sh → running"
+      bash install.sh
+    elif [[ -f Cargo.toml ]]; then
+      log "Rust project → cargo install --path ."
+      cargo install --path .
+    elif [[ -f pyproject.toml ]] || [[ -f setup.py ]]; then
+      log "Python project → pipx install ."
+      pipx install . || pip install --user .
+    else
+      log "cloned to $dest — no known installer found. Inspect & build manually."
+    fi
+    return
+  fi
+
+  # Archive or binary → download
+  local fname="$HOME/.local/bin/$(basename "${url%%\?*}")"
+  case "$url" in
+    *.tar.gz|*.tgz|*.tar.xz|*.tar.bz2|*.zip)
+      local tmp
+      tmp=$(mktemp -d)
+      log "downloading archive → $tmp"
+      curl -L --fail -o "$tmp/archive" "$url"
+      log "extracting into $tmp — move binaries into ~/.local/bin manually"
+      ( cd "$tmp" && case "$url" in
+          *.zip) unzip archive ;;
+          *)     tar xf archive ;;
+      esac )
+      log "extracted to: $tmp — review then move binaries as needed"
+      ;;
+    *)
+      log "downloading binary → $fname"
+      curl -L --fail -o "$fname" "$url"
+      chmod +x "$fname"
+      ok "installed: $fname"
+      ;;
+  esac
+}
+
+if [[ "$QUERY" =~ ^(https?://|git@) ]]; then
+  install_from_url "$QUERY"
+  exit 0
+fi
+
+# ─── Search mode ───────────────────────────────────────────────────────
+log "searching official repos + AUR for: ${C_BOLD}$QUERY${C_RESET}"
+
+# Pacman: combine name + desc lines into one row each
+pac_results=$(
+  pacman -Ss "$QUERY" 2>/dev/null | \
+  awk '
+    /^[^ ]/ { split($1,a,"/"); repo=a[1]; pkg=a[2]; ver=$2;
+              desc=""; getline desc;
+              sub(/^[[:space:]]+/,"",desc);
+              printf "repo\t%s\t%s\t%s (%s)\n", pkg, desc, repo, ver }
+  ' || true
+)
+
+# AUR: RPC search
+encoded=$(printf %s "$QUERY" | jq -sRr @uri)
+aur_json=$(curl -sf "https://aur.archlinux.org/rpc/?v=5&type=search&by=name-desc&arg=$encoded" || echo '{}')
+aur_results=$(
+  printf '%s' "$aur_json" | \
+  jq -r '.results // [] | sort_by(-.NumVotes)[:40][] |
+         "aur\t\(.Name)\t\(.Description // "")\tAUR (\(.Version), \(.NumVotes) votes)"' \
+  2>/dev/null || true
+)
+
+combined=$(printf "%s\n%s" "$pac_results" "$aur_results" | sed '/^$/d')
+
+if [[ -z "$combined" ]]; then
+  err "no matches for: $QUERY"
+  log "tip: try a single keyword, or pass a URL directly"
+  exit 1
+fi
+
+# Pretty table for fzf
+formatted=$(
+  printf '%s\n' "$combined" | \
+  awk -F'\t' -v c_src=$'\033[36m' -v c_pkg=$'\033[1;32m' \
+             -v c_meta=$'\033[2m' -v c_rst=$'\033[0m' '
+    { printf "%s%-5s%s  %s%-28s%s  %s  %s(%s)%s\n",
+             c_src, $1, c_rst, c_pkg, $2, c_rst, $3, c_meta, $4, c_rst }
+  '
+)
+
+selection=$(
+  printf '%s\n' "$formatted" | \
+  fzf --ansi \
+      --prompt="glassy-install > " \
+      --height=80% --layout=reverse --border \
+      --header="↑↓ to pick · Enter to install · Esc to cancel  ·  query: $QUERY" \
+      --preview-window=hidden
+)
+
+[[ -z "$selection" ]] && { log "cancelled"; exit 0; }
+
+# Parse back the first two fields (strip ANSI then split)
+plain=$(printf '%s' "$selection" | sed $'s/\033\\[[0-9;]*m//g')
+source=$(awk '{print $1}' <<<"$plain")
+pkg=$(awk '{print $2}'   <<<"$plain")
+
+case "$source" in
+  repo)
+    log "installing ${C_BOLD}$pkg${C_RESET} from official repos"
+    sudo pacman -S --needed "$pkg"
+    ;;
+  aur)
+    if [[ -z "$AUR_HELPER" ]]; then
+      err "no AUR helper found (paru/yay). Install one first:"
+      err "  sudo pacman -S base-devel git && git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si"
+      exit 1
+    fi
+    log "installing ${C_BOLD}$pkg${C_RESET} from AUR via $AUR_HELPER"
+    "$AUR_HELPER" -S --needed "$pkg"
+    ;;
+  *)
+    err "unknown source: $source"
+    exit 1
+    ;;
+esac
+
+ok "done."

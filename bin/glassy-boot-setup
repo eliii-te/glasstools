@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+# glassy-boot-setup — glassyOS Plymouth boot animation
+#
+# Strategy: Plymouth + image-based GOS theme + silent boot
+# Frees space by removing /boot/intel-ucode.img (already embedded in UKI via microcode hook)
+#
+# Usage:
+#   glassy-boot-setup             install
+#   glassy-boot-setup --uninstall revert
+#   glassy-boot-setup --status    show state
+
+set -euo pipefail
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'; C_RED=$'\033[31m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""
+fi
+log()   { printf "%s[boot]%s %s\n"   "$C_CYAN"   "$C_RESET" "$*" >&2; }
+step()  { printf "\n%s▸ %s%s\n"      "$C_BOLD"   "$*" "$C_RESET" >&2; }
+ok()    { printf "%s[ok]%s %s\n"     "$C_GREEN"  "$C_RESET" "$*" >&2; }
+warn()  { printf "%s[warn]%s %s\n"   "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()   { printf "%s[error]%s %s\n"  "$C_RED"    "$C_RESET" "$*" >&2; }
+
+THEME="glassyos"
+THEME_DIR="/usr/share/plymouth/themes/$THEME"
+PLYMOUTH_CONF="/etc/plymouth/plymouthd.conf"
+MKINITCPIO="/etc/mkinitcpio.conf"
+KERNEL_CMDLINE="/etc/kernel/cmdline"
+PRESET="/etc/mkinitcpio.d/linux.preset"
+BACKUP="$HOME/.local/share/glassy/boot-backup"
+
+SILENCE_PARAMS=(
+  "quiet"
+  "loglevel=3"
+  "splash"
+  "rd.systemd.show_status=false"
+  "systemd.show_status=false"
+  "rd.udev.log_level=3"
+  "udev.log_level=3"
+  "vt.global_cursor_default=0"
+)
+
+# ─── Speicher auf EFI-Partition freigeben ────────────────────────────
+free_efi_space() {
+  if [[ -f /boot/intel-ucode.img ]]; then
+    log "/boot/intel-ucode.img (15MB) ist Duplikat — Mikrocode ist via 'microcode'-Hook im UKI"
+    sudo rm -f /boot/intel-ucode.img
+    ok "15MB freigegeben"
+  fi
+  # Alte EOS-Reste die nicht mehr genutzt werden
+  if [[ -d /boot/EFI/endeavouros ]]; then
+    log "alte EndeavourOS-Reste werden entfernt"
+    sudo rm -rf /boot/EFI/endeavouros
+    ok "EndeavourOS-Verzeichnis entfernt"
+  fi
+}
+
+# ─── Kernel-Duplikat /boot/vmlinuz-linux entfernen ───────────────────
+# Der Kernel liegt sowohl in /usr/lib/modules/$KVER/vmlinuz (vom Paket)
+# als auch in /boot/vmlinuz-linux (durch alpm-Hook kopiert). Letzterer
+# wird nur gebraucht wenn ALL_kver darauf zeigt — also stellen wir die
+# Preset um auf die Paket-Quelle und löschen die Kopie.
+trim_kernel() {
+  if [[ ! -f /boot/vmlinuz-linux ]]; then
+    ok "/boot/vmlinuz-linux bereits entfernt"
+    return 0
+  fi
+
+  mkdir -p "$BACKUP"
+  cp "$PRESET" "$BACKUP/linux.preset.pretrim.bak"
+
+  # Aktuelle ALL_kver-Zeile durch dynamische Auflösung ersetzen
+  if grep -q '^ALL_kver="/boot/vmlinuz-linux"' "$PRESET"; then
+    log "Preset wird auf /usr/lib/modules/\$KVER/vmlinuz umgestellt"
+    sudo awk '
+      /^ALL_kver="\/boot\/vmlinuz-linux"/ {
+        print "for _d in /usr/lib/modules/*/; do [[ \"$(cat \"$_d/pkgbase\" 2>/dev/null)\" == \"linux\" ]] && ALL_kver=\"${_d}vmlinuz\"; done"
+        next
+      }
+      { print }
+    ' "$BACKUP/linux.preset.pretrim.bak" | sudo tee "$PRESET" > /dev/null
+    ok "Preset aktualisiert (Kernel wird direkt aus dem Paket gelesen)"
+  fi
+
+  # Verifizieren dass die neue Auflösung funktioniert
+  local resolved
+  resolved=$(for _d in /usr/lib/modules/*/; do
+    [[ "$(cat "$_d/pkgbase" 2>/dev/null)" == "linux" ]] && echo "${_d}vmlinuz"
+  done | head -1)
+  if [[ ! -f "$resolved" ]]; then
+    err "Auflösung schlug fehl ($resolved nicht gefunden) — Preset wird wiederhergestellt"
+    sudo cp "$BACKUP/linux.preset.pretrim.bak" "$PRESET"
+    return 1
+  fi
+  ok "Kernel-Quelle: $resolved"
+
+  log "/boot/vmlinuz-linux (16MB Duplikat) wird entfernt"
+  sudo rm -f /boot/vmlinuz-linux
+  ok "16MB freigegeben"
+}
+
+# ─── Plymouth-Installation prüfen ────────────────────────────────────
+install_plymouth() {
+  if ! command -v plymouthd >/dev/null; then
+    log "Plymouth wird aus AUR installiert..."
+    paru -S --needed --noconfirm plymouth
+  else
+    ok "Plymouth installiert: $(pacman -Q plymouth 2>/dev/null | awk '{print $2}')"
+  fi
+}
+
+# ─── GOS-Logo PNG generieren ─────────────────────────────────────────
+generate_logo() {
+  local out="$1"
+  # glassyOS Berg-Logo: solides Außendreieck, Cutout-Frame endet vor Boden,
+  # inneres Peak wächst aus solidem Boden bis zur Cutout-Linie hoch.
+  magick -size 400x400 xc:transparent \
+    -fill "rgb(184,208,255)" \
+    -draw "polygon 200,40 370,360 30,360" \
+    -fill "rgb(5,5,14)" \
+    -draw "polygon 200,130 295,330 105,330" \
+    -fill "rgb(184,208,255)" \
+    -draw "polygon 200,175 250,330 150,330" \
+    "$out" 2>/dev/null
+}
+
+# ─── Plymouth-Theme erstellen ────────────────────────────────────────
+create_theme() {
+  log "GOS-Theme wird erstellt..."
+
+  local tmp_logo tmp_dot
+  tmp_logo=$(mktemp /tmp/glassyos-logo-XXXXXX.png)
+  tmp_dot=$(mktemp /tmp/glassyos-dot-XXXXXX.png)
+  generate_logo "$tmp_logo"
+  magick -size 14x14 xc:transparent -fill "rgb(184,208,255)" \
+    -draw "circle 7,7 7,1" "$tmp_dot" 2>/dev/null
+
+  sudo mkdir -p "$THEME_DIR"
+  sudo cp "$tmp_logo" "$THEME_DIR/logo.png"
+  sudo cp "$tmp_dot" "$THEME_DIR/dot.png"
+  rm -f "$tmp_logo" "$tmp_dot"
+  ok "Logo: $THEME_DIR/logo.png + dot.png"
+
+  # Theme-Metadaten
+  sudo tee "$THEME_DIR/$THEME.plymouth" > /dev/null <<EOF
+[Plymouth Theme]
+Name=glassyOS
+Description=Animated GOS peak logo
+ModuleName=script
+
+[script]
+ImageDir=$THEME_DIR
+ScriptFile=$THEME_DIR/$THEME.script
+EOF
+
+  # Animations-Skript (keine Fonts → klein im Initramfs)
+  sudo tee "$THEME_DIR/$THEME.script" > /dev/null <<'PLYSCRIPT'
+// glassyOS — animiertes Peak-Logo + dot-loader (keine Fonts)
+
+Window.SetBackgroundTopColor(0.020, 0.020, 0.055);
+Window.SetBackgroundBottomColor(0.012, 0.012, 0.040);
+
+w = Window.GetWidth();
+h = Window.GetHeight();
+
+// Logo zentriert
+logo_img = Image("logo.png");
+logo = Sprite(logo_img);
+logo_x = (w - logo_img.GetWidth()) / 2;
+logo_y = (h - logo_img.GetHeight()) / 2;
+logo.SetX(logo_x);
+logo.SetY(logo_y);
+logo.SetOpacity(0);
+
+// Drei Lade-Punkte unter dem Logo
+dot_img = Image("dot.png");
+dot_w = dot_img.GetWidth();
+dot_spacing = 22;
+dot_y = logo_y + logo_img.GetHeight() + 50;
+dot_cx = w / 2;
+
+dot1 = Sprite(dot_img);
+dot1.SetX(dot_cx - dot_spacing - dot_w / 2);
+dot1.SetY(dot_y);
+dot1.SetOpacity(0);
+
+dot2 = Sprite(dot_img);
+dot2.SetX(dot_cx - dot_w / 2);
+dot2.SetY(dot_y);
+dot2.SetOpacity(0);
+
+dot3 = Sprite(dot_img);
+dot3.SetX(dot_cx + dot_spacing - dot_w / 2);
+dot3.SetY(dot_y);
+dot3.SetOpacity(0);
+
+// Animationszustand
+frame = 0;
+pulse_t = 0;
+FADE_FRAMES = 30;
+
+fun dot_alpha(phase) {
+    s = Math.Sin(pulse_t * 2 - phase);
+    a = 0.25 + (s + 1) * 0.35;
+    return a;
+}
+
+fun refresh_callback() {
+    frame = frame + 1;
+
+    if (frame <= FADE_FRAMES) {
+        // Sanfter ease-out Fade-In
+        progress = frame / FADE_FRAMES;
+        eased = 1 - (1 - progress) * (1 - progress);
+        logo.SetOpacity(eased);
+        dot1.SetOpacity(eased * 0.6);
+        dot2.SetOpacity(eased * 0.6);
+        dot3.SetOpacity(eased * 0.6);
+    } else {
+        // Logo: ruhiges Atmen
+        pulse_t = pulse_t + 0.06;
+        breath = 0.85 + Math.Sin(pulse_t) * 0.12;
+        logo.SetOpacity(breath);
+
+        // Punkte: laufende Welle (Phase-Offset 0, 0.7, 1.4)
+        dot1.SetOpacity(dot_alpha(0));
+        dot2.SetOpacity(dot_alpha(0.7));
+        dot3.SetOpacity(dot_alpha(1.4));
+    }
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+PLYSCRIPT
+  ok "Theme-Skript: $THEME_DIR/$THEME.script"
+}
+
+# ─── Theme als Standard setzen (direkt in Konfig schreiben, kein TTY nötig) ─
+set_theme() {
+  mkdir -p "$BACKUP"
+  [[ -f "$PLYMOUTH_CONF" ]] && cp "$PLYMOUTH_CONF" "$BACKUP/plymouthd.conf.bak" 2>/dev/null || true
+  sudo tee "$PLYMOUTH_CONF" > /dev/null <<EOF
+[Daemon]
+Theme=$THEME
+EOF
+  ok "Plymouth-Standard-Theme: $THEME"
+}
+
+# ─── mkinitcpio HOOKS: plymouth nach kms ────────────────────────────
+update_mkinitcpio() {
+  mkdir -p "$BACKUP"
+  cp "$MKINITCPIO" "$BACKUP/mkinitcpio.conf.bak"
+
+  if grep -q '\bplymouth\b' "$MKINITCPIO"; then
+    ok "plymouth bereits in HOOKS"
+  else
+    sudo sed -i 's/\bkms\b/kms plymouth/' "$MKINITCPIO"
+    ok "plymouth-Hook nach kms eingefügt"
+  fi
+  log "$(grep '^HOOKS' "$MKINITCPIO")"
+}
+
+# ─── Preset: BMP-Splash entfernen (Plymouth übernimmt) ─────────────
+update_preset() {
+  mkdir -p "$BACKUP"
+  cp "$PRESET" "$BACKUP/linux.preset.bak" 2>/dev/null || true
+
+  if grep -q '^default_options=' "$PRESET"; then
+    sudo sed -i 's|^default_options=.*|#default_options=""|' "$PRESET"
+    ok "Preset: --splash entfernt (Plymouth zeigt jetzt das Bild)"
+  fi
+}
+
+# ─── Kernel-Cmdline: splash + Stille-Parameter ──────────────────────
+update_cmdline() {
+  mkdir -p "$BACKUP"
+  [[ -f "$KERNEL_CMDLINE" ]] && cp "$KERNEL_CMDLINE" "$BACKUP/kernel-cmdline.bak"
+
+  local new
+  new=$(tr -s '[:space:]' ' ' < "$KERNEL_CMDLINE" | sed 's/^ *//; s/ *$//')
+
+  for param in "${SILENCE_PARAMS[@]}"; do
+    echo "$new" | grep -qw "$param" || new="$new $param"
+  done
+
+  printf '%s\n' "$new" | sudo tee "$KERNEL_CMDLINE" > /dev/null
+  ok "Cmdline aktualisiert"
+  log "$(cat "$KERNEL_CMDLINE")"
+}
+
+# ─── UKI neu bauen ───────────────────────────────────────────────────
+rebuild() {
+  step "UKI wird neu gebaut (~30 Sek.)"
+  sudo mkinitcpio -P
+  local size free
+  size=$(du -h /boot/EFI/Linux/arch-linux.efi 2>/dev/null | cut -f1 || echo '?')
+  free=$(df -h /boot | awk 'NR==2{print $4}')
+  ok "UKI: $size  |  EFI frei: $free"
+}
+
+# ─── Install ──────────────────────────────────────────────────────────
+do_install() {
+  step "EFI-Partition vorbereiten"
+  df -h /boot
+  free_efi_space
+  trim_kernel
+  df -h /boot
+
+  step "Plymouth"
+  install_plymouth
+
+  step "GOS-Theme erstellen"
+  create_theme
+  set_theme
+
+  step "mkinitcpio HOOKS (+ plymouth)"
+  update_mkinitcpio
+
+  step "Preset (BMP-Splash entfernen)"
+  update_preset
+
+  step "Kernel-Cmdline (splash + Stille)"
+  update_cmdline
+
+  rebuild
+
+  echo
+  ok "Plymouth Boot-Animation installiert — neu starten zum Ansehen"
+  log ""
+  log "Animation: GOS-Peak fadet ein, dann sanftes Pulsieren"
+  log "Boot ist komplett textlos (Plymouth übernimmt den Bildschirm)"
+}
+
+# ─── Uninstall ────────────────────────────────────────────────────────
+do_uninstall() {
+  step "mkinitcpio.conf wiederherstellen"
+  if [[ -f "$BACKUP/mkinitcpio.conf.bak" ]]; then
+    sudo cp "$BACKUP/mkinitcpio.conf.bak" "$MKINITCPIO"
+    ok "wiederhergestellt"
+  else
+    sudo sed -i 's/ plymouth//' "$MKINITCPIO"
+    ok "plymouth manuell entfernt"
+  fi
+
+  step "Cmdline wiederherstellen"
+  if [[ -f "$BACKUP/kernel-cmdline.bak" ]]; then
+    sudo cp "$BACKUP/kernel-cmdline.bak" "$KERNEL_CMDLINE"
+    ok "wiederhergestellt"
+  else
+    local current
+    current=$(cat "$KERNEL_CMDLINE")
+    for param in "${SILENCE_PARAMS[@]}"; do
+      current=$(echo "$current" | sed "s/\b${param}\b//g" | tr -s ' ' | sed 's/ *$//')
+    done
+    printf '%s\n' "$current" | sudo tee "$KERNEL_CMDLINE" > /dev/null
+  fi
+
+  step "Preset wiederherstellen"
+  if [[ -f "$BACKUP/linux.preset.bak" ]]; then
+    sudo cp "$BACKUP/linux.preset.bak" "$PRESET"
+    ok "wiederhergestellt"
+  fi
+
+  step "Plymouth-Theme entfernen"
+  [[ -d "$THEME_DIR" ]] && sudo rm -rf "$THEME_DIR" && ok "Theme entfernt"
+  if [[ -f "$BACKUP/plymouthd.conf.bak" ]]; then
+    sudo cp "$BACKUP/plymouthd.conf.bak" "$PLYMOUTH_CONF"
+  fi
+
+  rebuild
+  ok "Uninstall abgeschlossen — neu starten"
+}
+
+# ─── Status ───────────────────────────────────────────────────────────
+do_status() {
+  step "EFI-Partition"
+  df -h /boot
+  ls -lh /boot/EFI/Linux/*.efi 2>/dev/null
+
+  step "Plymouth"
+  command -v plymouthd >/dev/null && ok "plymouth $(pacman -Q plymouth 2>/dev/null | awk '{print $2}')" || warn "nicht installiert"
+  log "Aktives Theme: $(grep '^Theme' "$PLYMOUTH_CONF" 2>/dev/null || echo 'nicht gesetzt')"
+  [[ -d "$THEME_DIR" ]] && ok "GOS-Theme vorhanden" || warn "GOS-Theme nicht installiert"
+
+  step "mkinitcpio"
+  grep '^HOOKS' "$MKINITCPIO"
+
+  step "Cmdline (gespeichert)"
+  log "$(cat "$KERNEL_CMDLINE")"
+
+  step "Cmdline (laufend)"
+  log "$(cat /proc/cmdline)"
+}
+
+do_trim() {
+  step "EFI-Partition (vorher)"
+  df -h /boot
+  step "Duplikate entfernen"
+  free_efi_space
+  trim_kernel
+  step "UKI neu bauen (verifiziert die neue Kernel-Quelle)"
+  sudo mkinitcpio -P
+  step "EFI-Partition (nachher)"
+  df -h /boot
+  ok "Duplikate entfernt"
+}
+
+usage() {
+  cat <<EOF
+${C_BOLD}glassy-boot-setup${C_RESET} — glassyOS Plymouth Boot-Animation
+
+  glassy-boot-setup             installieren (Plymouth + GOS-Logo)
+  glassy-boot-setup --trim      nur Duplikate entfernen (intel-ucode + vmlinuz)
+  glassy-boot-setup --uninstall zurücksetzen
+  glassy-boot-setup --status    aktuellen Stand anzeigen
+EOF
+}
+
+case "${1:-}" in
+  ""|install)    do_install ;;
+  --trim)        do_trim ;;
+  --uninstall)   do_uninstall ;;
+  --status)      do_status ;;
+  -h|--help)     usage; exit 0 ;;
+  *) err "unbekannt: $1"; exit 1 ;;
+esac

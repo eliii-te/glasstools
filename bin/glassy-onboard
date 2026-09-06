@@ -1,0 +1,1027 @@
+#!/usr/bin/python3
+# glassy-onboard — animated GUI welcome tour for glassyOS
+#
+# Fullscreen GTK4 + libadwaita app. Smooth carousel pages with a
+# Cairo-animated logo, key chips, a Waybar mock, and per-tool cards.
+# Auto-runs once on first session via Hyprland exec-once.
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
+
+MARKER_DIR = Path(
+    os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+) / "glassy"
+MARKER_FILE = MARKER_DIR / "onboard-done"
+
+# ───── Theme ──────────────────────────────────────────────────────────
+SKY = "#b8d0ff"
+ICE = "#e8efff"
+DEEP_BG = "#070a14"
+CARD_BG = "#11172a"
+
+CSS = b"""
+window, .bg {
+    background-color: #070a14;
+    background-image:
+        radial-gradient(ellipse 80% 60% at 50% 25%,
+            rgba(184,208,255,0.18) 0%,
+            rgba(184,208,255,0.04) 35%,
+            rgba(0,0,0,0) 70%),
+        linear-gradient(180deg, #0a0f1f 0%, #050810 100%);
+    color: #e8efff;
+}
+.title {
+    font-size: 44pt;
+    font-weight: 800;
+    color: #ffffff;
+    letter-spacing: -1.5px;
+}
+.title-small {
+    font-size: 32pt;
+    font-weight: 800;
+    color: #ffffff;
+    letter-spacing: -1px;
+}
+.eyebrow {
+    font-size: 11pt;
+    font-weight: 700;
+    color: #8aa8ee;
+    letter-spacing: 4px;
+}
+.tagline {
+    font-size: 17pt;
+    font-style: italic;
+    color: #b8d0ff;
+}
+.subtitle {
+    font-size: 19pt;
+    color: #d8e0f4;
+    font-weight: 400;
+}
+.body {
+    font-size: 13pt;
+    color: #a8b4ce;
+}
+.body-large {
+    font-size: 15pt;
+    color: #c8d4ee;
+}
+.tool-glyph {
+    font-size: 56pt;
+    color: #b8d0ff;
+}
+.tool-name {
+    font-family: "JetBrainsMono Nerd Font", "Fira Code", "DejaVu Sans Mono", monospace;
+    font-size: 22pt;
+    font-weight: 700;
+    color: #ffffff;
+}
+.code {
+    font-family: "JetBrainsMono Nerd Font", "Fira Code", "DejaVu Sans Mono", monospace;
+    font-size: 13pt;
+    color: #b8d0ff;
+    background-color: rgba(184, 208, 255, 0.08);
+    padding: 12px 22px;
+    border-radius: 12px;
+    border: 1px solid rgba(184, 208, 255, 0.18);
+}
+.code-prompt {
+    color: #ffb072;
+    font-weight: 700;
+}
+.card {
+    background-color: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 28px;
+    padding: 40px;
+}
+.card-soft {
+    background-color: rgba(184, 208, 255, 0.05);
+    border: 1px solid rgba(184, 208, 255, 0.10);
+    border-radius: 22px;
+    padding: 22px;
+}
+.key-chip {
+    background-color: rgba(184, 208, 255, 0.10);
+    color: #ffffff;
+    padding: 8px 16px;
+    border-radius: 10px;
+    border-top: 1px solid rgba(184, 208, 255, 0.30);
+    border-left: 1px solid rgba(184, 208, 255, 0.20);
+    border-right: 1px solid rgba(184, 208, 255, 0.20);
+    border-bottom: 3px solid rgba(184, 208, 255, 0.45);
+    font-family: "JetBrainsMono Nerd Font", "Fira Code", "DejaVu Sans Mono", monospace;
+    font-size: 12pt;
+    font-weight: 700;
+    min-width: 28px;
+}
+.key-plus {
+    color: #6c7a96;
+    font-size: 16pt;
+    font-weight: 300;
+    padding: 0 4px;
+}
+.key-desc {
+    color: #d8e0f4;
+    font-size: 14pt;
+}
+button.pill {
+    background: linear-gradient(180deg, #c8dcff 0%, #8aa8ee 100%);
+    color: #0a0e1a;
+    font-weight: 700;
+    font-size: 13pt;
+    padding: 14px 38px;
+    border-radius: 999px;
+    border: none;
+    box-shadow: 0 6px 20px rgba(184, 208, 255, 0.25);
+    transition: 200ms ease;
+}
+button.pill:hover {
+    background: linear-gradient(180deg, #d8e8ff 0%, #9ab8fa 100%);
+    box-shadow: 0 8px 28px rgba(184, 208, 255, 0.38);
+}
+button.ghost {
+    background-color: transparent;
+    color: #a8b4ce;
+    padding: 12px 22px;
+    border-radius: 999px;
+    border: none;
+    transition: 150ms ease;
+}
+button.ghost:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: #ffffff;
+}
+.waybar-mock {
+    background-color: rgba(10, 14, 26, 0.92);
+    border: 1px solid rgba(184, 208, 255, 0.20);
+    border-radius: 18px;
+    padding: 6px 12px;
+}
+.waybar-item {
+    color: #d8e0f4;
+    padding: 6px 12px;
+    border-radius: 10px;
+    font-size: 14pt;
+}
+.waybar-item.hot {
+    background-color: rgba(184, 208, 255, 0.15);
+    color: #ffffff;
+}
+.popup-mock {
+    background-color: rgba(26, 34, 56, 0.92);
+    border: 1px solid rgba(184, 208, 255, 0.30);
+    border-radius: 16px;
+    padding: 14px 18px;
+    color: #d8e0f4;
+    font-size: 11pt;
+}
+.popup-title {
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 12pt;
+}
+.arrow {
+    color: #b8d0ff;
+    font-size: 22pt;
+}
+.dim {
+    color: #6c7a96;
+}
+.divider {
+    background-color: rgba(184, 208, 255, 0.15);
+    min-height: 1px;
+}
+carouselindicatordots {
+    color: rgba(184, 208, 255, 0.30);
+}
+"""
+
+
+# ───── Animated Cairo logo ───────────────────────────────────────────
+class TriangleLogo(Gtk.DrawingArea):
+    """Animated glassyOS triangle peak — same geometry as Plymouth."""
+
+    def __init__(self, size: int = 280):
+        super().__init__()
+        self.size = size
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+        self._t0 = GLib.get_monotonic_time()
+        self._t = 0.0
+        self.add_tick_callback(self._tick)
+
+    def _tick(self, widget, frame_clock):
+        self._t = (frame_clock.get_frame_time() - self._t0) / 1_000_000.0
+        self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        scale = min(w, h) / 400.0
+        cr.translate((w - 400 * scale) / 2.0, (h - 400 * scale) / 2.0)
+        cr.scale(scale, scale)
+
+        pulse = 0.5 + 0.5 * math.sin(self._t * 1.4)
+        glow_radius = 220 + 30 * pulse
+
+        # soft halo behind logo
+        pat = self._radial_gradient(200, 200, glow_radius, pulse)
+        cr.set_source(pat)
+        cr.rectangle(0, 0, 400, 400)
+        cr.fill()
+
+        # outer triangle
+        cr.set_source_rgba(
+            184 / 255, 208 / 255, 255 / 255, 0.92 + 0.08 * pulse
+        )
+        cr.move_to(200, 40)
+        cr.line_to(370, 360)
+        cr.line_to(30, 360)
+        cr.close_path()
+        cr.fill()
+
+        # cutout
+        cr.set_source_rgba(7 / 255, 10 / 255, 20 / 255, 1.0)
+        cr.move_to(200, 130)
+        cr.line_to(295, 330)
+        cr.line_to(105, 330)
+        cr.close_path()
+        cr.fill()
+
+        # inner peak (pulsing)
+        glow = 0.78 + 0.22 * pulse
+        cr.set_source_rgba(232 / 255, 239 / 255, 255 / 255, glow)
+        cr.move_to(200, 175)
+        cr.line_to(250, 330)
+        cr.line_to(150, 330)
+        cr.close_path()
+        cr.fill()
+
+    def _radial_gradient(self, cx, cy, r, pulse):
+        import cairo
+
+        pat = cairo.RadialGradient(cx, cy, 20, cx, cy, r)
+        a0 = 0.18 + 0.10 * pulse
+        pat.add_color_stop_rgba(0, 184 / 255, 208 / 255, 255 / 255, a0)
+        pat.add_color_stop_rgba(0.5, 184 / 255, 208 / 255, 255 / 255, a0 * 0.3)
+        pat.add_color_stop_rgba(1, 0, 0, 0, 0)
+        return pat
+
+
+# ───── Helpers ───────────────────────────────────────────────────────
+def label(text: str, *classes: str, wrap: bool = True, justify: bool = False) -> Gtk.Label:
+    lbl = Gtk.Label(label=text)
+    lbl.set_use_markup(True)
+    lbl.set_wrap(wrap)
+    if wrap:
+        lbl.set_wrap_mode(Pango.WrapMode.WORD)
+    if justify:
+        lbl.set_justify(Gtk.Justification.CENTER)
+    for c in classes:
+        lbl.add_css_class(c)
+    return lbl
+
+
+def vbox(spacing: int = 0, *classes: str) -> Gtk.Box:
+    b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+    for c in classes:
+        b.add_css_class(c)
+    return b
+
+
+def hbox(spacing: int = 0, *classes: str) -> Gtk.Box:
+    b = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=spacing)
+    for c in classes:
+        b.add_css_class(c)
+    return b
+
+
+def keychip(text: str) -> Gtk.Label:
+    l = Gtk.Label(label=text)
+    l.add_css_class("key-chip")
+    return l
+
+
+def keyrow(keys: list[str], desc: str) -> Gtk.Widget:
+    """One row: [Key] + [Key] + [Key]   description"""
+    row = hbox(8)
+    row.set_valign(Gtk.Align.CENTER)
+    chips = hbox(0)
+    chips.set_valign(Gtk.Align.CENTER)
+    for i, k in enumerate(keys):
+        if i > 0:
+            plus = Gtk.Label(label="+")
+            plus.add_css_class("key-plus")
+            chips.append(plus)
+        chips.append(keychip(k))
+
+    chips.set_size_request(280, -1)
+    chips.set_halign(Gtk.Align.START)
+    row.append(chips)
+
+    arrow = Gtk.Label(label="→")
+    arrow.add_css_class("dim")
+    arrow.set_margin_start(8)
+    arrow.set_margin_end(12)
+    row.append(arrow)
+
+    d = label(desc, "key-desc")
+    d.set_halign(Gtk.Align.START)
+    d.set_xalign(0)
+    row.append(d)
+    return row
+
+
+def code_block(*lines: str) -> Gtk.Label:
+    parts = []
+    for ln in lines:
+        parts.append(
+            f'<span foreground="#ffb072" weight="bold">$</span>  {GLib.markup_escape_text(ln)}'
+        )
+    l = Gtk.Label()
+    l.set_markup("\n".join(parts))
+    l.add_css_class("code")
+    l.set_xalign(0)
+    l.set_halign(Gtk.Align.CENTER)
+    l.set_selectable(True)
+    return l
+
+
+def page_shell(eyebrow: str, title: str, build_body) -> Gtk.Widget:
+    """Common scaffold: small eyebrow tag + big title + body block, all centered."""
+    outer = vbox(0)
+    outer.set_valign(Gtk.Align.CENTER)
+    outer.set_halign(Gtk.Align.CENTER)
+    outer.set_margin_top(40)
+    outer.set_margin_bottom(40)
+    outer.set_margin_start(60)
+    outer.set_margin_end(60)
+
+    if eyebrow:
+        eb = label(eyebrow.upper(), "eyebrow")
+        eb.set_margin_bottom(12)
+        outer.append(eb)
+
+    t = label(title, "title-small")
+    t.set_margin_bottom(28)
+    outer.append(t)
+
+    body = build_body()
+    if body is not None:
+        outer.append(body)
+
+    return outer
+
+
+# ───── Slide builders ────────────────────────────────────────────────
+def build_welcome() -> Gtk.Widget:
+    box = vbox(0)
+    box.set_valign(Gtk.Align.CENTER)
+    box.set_halign(Gtk.Align.CENTER)
+
+    logo = TriangleLogo(280)
+    logo.set_margin_bottom(24)
+    box.append(logo)
+
+    eb = label("WELCOME TO", "eyebrow")
+    eb.set_margin_bottom(8)
+    box.append(eb)
+
+    t = label("glassyOS", "title")
+    t.set_margin_bottom(18)
+    box.append(t)
+
+    s = label(
+        "A clean, calm, beautifully composed Linux desktop.",
+        "subtitle",
+    )
+    s.set_margin_bottom(12)
+    box.append(s)
+
+    s2 = label(
+        '<span foreground="#8aa8ee">Three minutes. Every tool, every key.</span>',
+        "body-large",
+    )
+    box.append(s2)
+    return box
+
+
+def build_philosophy() -> Gtk.Widget:
+    def body():
+        b = vbox(20)
+        b.set_size_request(720, -1)
+
+        for text in [
+            ("●", "Every system task has a <b>glassy-*</b> command."),
+            ("●", "Every command is safe by default, with clear status output."),
+            ("●", "The desktop favors keyboard flow over clicking."),
+            ("●", "The look stays soft, transparent, low contrast on purpose."),
+        ]:
+            row = hbox(16)
+            row.set_halign(Gtk.Align.START)
+            dot = label(f'<span foreground="#b8d0ff" size="x-large">{text[0]}</span>')
+            dot.set_valign(Gtk.Align.CENTER)
+            row.append(dot)
+            row.append(label(text[1], "body-large"))
+            b.append(row)
+
+        sep = vbox(0, "divider")
+        sep.set_size_request(-1, 1)
+        sep.set_margin_top(20)
+        sep.set_margin_bottom(20)
+        b.append(sep)
+
+        b.append(
+            label(
+                '<i>Tap → or press <span foreground="#b8d0ff">Space</span> to continue.</i>',
+                "body",
+            )
+        )
+        return b
+
+    return page_shell("INTRODUCTION", "What is glassyOS", body)
+
+
+TOOLS = [
+    ("install",     "󰏖", "One installer to rule them all.",
+     "Searches pacman, then AUR, then accepts git URLs and curl scripts. Picks the right install method automatically and reports what it did.",
+     ["glassy-install firefox", "glassy-install https://github.com/foo/bar"]),
+    ("update",      "󰚰", "Safe, universal, with rollback notes.",
+     "Updates pacman, AUR (paru), flatpak, and any user-level package managers it finds. Snapshots key state before touching anything.",
+     ["glassy-update", "glassy-update --dry-run"]),
+    ("clean",       "󰃢", "Reclaim disk without breaking things.",
+     "Interactive cleanup: orphan packages, old caches, broken symlinks, incomplete builds. Nothing is deleted without confirmation.",
+     ["glassy-clean"]),
+    ("destroy",     "󰗨", "When uninstall isn't enough.",
+     "Deep-purges a package: the binary, its unique deps, configs, caches, and user data. Use only when a package refuses to leave cleanly.",
+     ["glassy-destroy <package>"]),
+    ("doctor",      "󰋽", "Is everything actually running?",
+     "Probes Bluetooth, Wi-Fi, PipeWire, Waybar, Hyprland, autostart daemons, and polkit. Tries to start or repair anything that is down.",
+     ["glassy-doctor", "glassy-doctor --no-fix"]),
+    ("fix",         "󰁨", "Automatic self-repair for the grumpy days.",
+     "Broader than doctor: rebuilds caches, refreshes mirrors, regenerates font caches, and patches common breakage after upgrades.",
+     ["glassy-fix"]),
+    ("checkup",     "󰒃", "Scan for malware and integrity damage.",
+     "Runs ClamAV + rkhunter + heuristic checks. Suspicious files are quarantined, never silently deleted.",
+     ["glassy-checkup", "glassy-checkup --quick"]),
+    ("secure",      "󰦝", "Watches your Downloads folder in real time.",
+     "Uses inotify to scan every new file in ~/Downloads with ClamAV the moment it lands. Run as a user service for always-on protection.",
+     ["glassy-secure", "systemctl --user enable --now glassy-secure"]),
+    ("splash",      "󰸉", "The little splash on login.",
+     "A short, animated welcome banner shown once when Hyprland starts. Pure cosmetic; safe to disable.",
+     ["glassy-splash"]),
+    ("boot-setup",  "󰍹", "Owns the boot animation.",
+     "Generates the Plymouth logo PNG, configures the theme, and rebuilds the unified kernel image (UKI). Run after editing the logo.",
+     ["sudo glassy-boot-setup"]),
+]
+
+
+def build_toolbox_overview() -> Gtk.Widget:
+    def body():
+        wrap = vbox(0)
+        wrap.set_size_request(900, -1)
+
+        intro = label(
+            "Ten commands cover the whole system lifecycle. The next slides show each one.",
+            "body-large",
+        )
+        intro.set_margin_bottom(28)
+        wrap.append(intro)
+
+        grid = Gtk.Grid(column_spacing=18, row_spacing=18)
+        grid.set_halign(Gtk.Align.CENTER)
+        for i, (name, glyph, *_rest) in enumerate(TOOLS):
+            cell = vbox(6, "card-soft")
+            cell.set_size_request(160, 110)
+            g = label(f'<span foreground="#b8d0ff" size="xx-large">{glyph}</span>')
+            g.set_halign(Gtk.Align.CENTER)
+            n = label(f"<b>glassy-{name}</b>", "body")
+            n.set_halign(Gtk.Align.CENTER)
+            cell.append(g)
+            cell.append(n)
+            grid.attach(cell, i % 5, i // 5, 1, 1)
+        wrap.append(grid)
+        return wrap
+
+    return page_shell("THE TOOLBOX", "Ten commands. One system.", body)
+
+
+def build_tool_page(idx: int, name: str, glyph: str, tagline: str, desc: str, examples: list[str]) -> Gtk.Widget:
+    def body():
+        card = hbox(40, "card")
+        card.set_size_request(900, -1)
+
+        # left: big glyph
+        left = vbox(0)
+        left.set_valign(Gtk.Align.CENTER)
+        g = label(f'<span foreground="#b8d0ff">{glyph}</span>', "tool-glyph")
+        g.set_halign(Gtk.Align.CENTER)
+        left.append(g)
+        left.set_size_request(140, -1)
+        card.append(left)
+
+        # right: text + code
+        right = vbox(14)
+        right.set_hexpand(True)
+        right.set_valign(Gtk.Align.CENTER)
+
+        n = label(f"glassy-{name}", "tool-name")
+        n.set_xalign(0)
+        right.append(n)
+
+        tl = label(f'<i>{GLib.markup_escape_text(tagline)}</i>', "tagline")
+        tl.set_xalign(0)
+        right.append(tl)
+
+        d = label(desc, "body-large")
+        d.set_xalign(0)
+        d.set_margin_top(8)
+        d.set_margin_bottom(8)
+        right.append(d)
+
+        right.append(code_block(*examples))
+        card.append(right)
+
+        wrap = vbox(0)
+        wrap.set_halign(Gtk.Align.CENTER)
+        wrap.append(card)
+        return wrap
+
+    return page_shell(f"TOOL · {idx}/{len(TOOLS)}", f"glassy-{name}", body)
+
+
+def build_quickshell_widgets() -> Gtk.Widget:
+    binds = [
+        (["Mod", "Ctrl", "M"], "Music player popup"),
+        (["Mod", "Ctrl", "B"], "Battery &amp; power profile"),
+        (["Mod", "Ctrl", "C"], "Calendar"),
+        (["Mod", "Ctrl", "N"], "Network / Wi-Fi panel"),
+        (["Mod", "Ctrl", "W"], "Wallpaper picker"),
+        (["Mod", "Ctrl", "T"], "Focus-time timer"),
+        (["Mod", "Ctrl", "G"], "Stewart assistant"),
+    ]
+
+    def body():
+        wrap = vbox(0)
+        wrap.set_size_request(820, -1)
+
+        intro = label(
+            "These open <b>Quickshell</b> popups — soft glass overlays that float "
+            "above the desktop. Press the binding again to dismiss.",
+            "body-large",
+        )
+        intro.set_xalign(0)
+        intro.set_wrap(True)
+        intro.set_margin_bottom(24)
+        wrap.append(intro)
+
+        rows = vbox(14, "card")
+        for keys, desc in binds:
+            rows.append(keyrow(keys, desc))
+        wrap.append(rows)
+        return wrap
+
+    return page_shell("QUICKSHELL · POPUPS", "Mod + Ctrl summons widgets", body)
+
+
+def build_waybar() -> Gtk.Widget:
+    def body():
+        wrap = vbox(28)
+        wrap.set_size_request(960, -1)
+
+        intro = label(
+            "Your Waybar is interactive. Click the icons to open Quickshell popups — "
+            "the same panels you can summon with <b>Mod + Ctrl</b> shortcuts.",
+            "body-large",
+        )
+        intro.set_xalign(0)
+        intro.set_wrap(True)
+        wrap.append(intro)
+
+        # Mock waybar
+        bar = hbox(8, "waybar-mock")
+        bar.set_halign(Gtk.Align.CENTER)
+        bar.set_size_request(880, -1)
+
+        # left side: workspaces + window
+        left = hbox(6)
+        for w in ["1", "2", "3", "4"]:
+            d = Gtk.Label(label=f"  {w}  ")
+            d.add_css_class("waybar-item")
+            left.append(d)
+        title = Gtk.Label(label="    kitty — ~/")
+        title.add_css_class("waybar-item")
+        title.add_css_class("dim")
+        left.append(title)
+        bar.append(left)
+
+        spacer = Gtk.Box(hexpand=True)
+        bar.append(spacer)
+
+        # right side: clickable items (highlighted)
+        right = hbox(4)
+        for icon, css_class in [
+            ("󰕾  62%", ""),
+            ("󰤨", "hot"),         # Wi-Fi
+            ("󱊣  84%", "hot"),     # Battery
+            ("13:42", "hot"),       # Clock
+        ]:
+            it = Gtk.Label(label=icon)
+            it.add_css_class("waybar-item")
+            if css_class:
+                it.add_css_class(css_class)
+            right.append(it)
+        bar.append(right)
+
+        wrap.append(bar)
+
+        # arrows + popups underneath
+        callouts = hbox(20)
+        callouts.set_halign(Gtk.Align.END)
+        callouts.set_margin_end(20)
+
+        for popup_title, popup_desc in [
+            ("󰤨  Wi-Fi", "scan, connect, toggle radios — without leaving the bar"),
+            ("󱊣  Power", "battery health, profile (saver / balanced / performance)"),
+            ("  Calendar", "month view, agenda, week numbers"),
+        ]:
+            col = vbox(8)
+            arrow = label('<span foreground="#b8d0ff" size="xx-large">↑</span>')
+            arrow.set_halign(Gtk.Align.CENTER)
+            col.append(arrow)
+
+            popup = vbox(6, "popup-mock")
+            popup.set_size_request(220, -1)
+            popup.append(label(popup_title, "popup-title"))
+            popup.append(label(popup_desc, "body"))
+            col.append(popup)
+            callouts.append(col)
+
+        wrap.append(callouts)
+        return wrap
+
+    return page_shell("WAYBAR · INTERACTIVE", "Click the bar. It clicks back.", body)
+
+
+def build_keys_launch() -> Gtk.Widget:
+    rows = [
+        (["Mod", "D"],            "App launcher (walker)"),
+        (["Mod", "Return"],       "Open terminal"),
+        (["Mod", "E"],            "File manager"),
+        (["Mod", "B"],            "Default browser"),
+        (["Mod", "S"],            "Web search"),
+        (["Mod", "Alt", "V"],     "Clipboard manager"),
+        (["Mod", "Alt", "C"],     "Calculator"),
+        (["Mod", "Alt", "E"],     "Emoji picker"),
+        (["Mod", "Shift", "Return"], "Dropdown terminal"),
+        (["Mod", "Ctrl", "S"],    "Window switcher"),
+    ]
+    return _keys_page("KEYS · 1/5", "Launch &amp; apps", rows)
+
+
+def build_keys_window() -> Gtk.Widget:
+    rows = [
+        (["Mod", "Q"],            "Close active window"),
+        (["Mod", "Shift", "Q"],   "Terminate process behind window"),
+        (["Mod", "Space"],        "Toggle floating"),
+        (["Mod", "Alt", "Space"], "Float all windows on workspace"),
+        (["Mod", "Shift", "F"],   "Fullscreen"),
+        (["Mod", "Ctrl", "F"],    "Maximize (keep gaps)"),
+        (["Mod", "I"],            "Add master"),
+        (["Mod", "Ctrl", "D"],    "Remove master"),
+        (["Mod", "Ctrl", "Return"], "Swap with master"),
+        (["Alt", "Tab"],          "Cycle next window"),
+    ]
+    return _keys_page("KEYS · 2/5", "Window control", rows)
+
+
+def build_keys_workspace() -> Gtk.Widget:
+    rows = [
+        (["Mod", "1…0"],          "Switch to workspace 1…10"),
+        (["Mod", "Shift", "1…0"], "Move window to workspace"),
+        (["Mod", "A"],            "Desktop overview"),
+        (["Mod", "Ctrl", "F9…F12"], "Move workspace between monitors"),
+        (["Mod", "Scroll"],       "Scroll between workspaces"),
+        (["Mod", "Alt", "L"],     "Toggle master / dwindle layout"),
+        (["Mod", "Alt", "O"],     "Toggle blur"),
+        (["Mod", "Shift", "I"],   "Toggle split (dwindle)"),
+    ]
+    return _keys_page("KEYS · 3/5", "Workspaces &amp; layout", rows)
+
+
+def build_keys_screenshot() -> Gtk.Widget:
+    rows = [
+        (["Mod", "Print"],            "Screenshot now (full)"),
+        (["Mod", "Shift", "Print"],   "Screenshot area"),
+        (["Mod", "Ctrl", "Print"],    "Screenshot in 5 seconds"),
+        (["Mod", "Ctrl", "Shift", "Print"], "Screenshot in 10 seconds"),
+        (["Alt", "Print"],            "Screenshot active window"),
+        (["Mod", "Shift", "S"],       "Snipping tool with editor"),
+    ]
+    return _keys_page("KEYS · 4/5", "Screenshots", rows)
+
+
+def build_keys_system() -> Gtk.Widget:
+    rows = [
+        (["Ctrl", "Alt", "L"],    "Lock screen"),
+        (["Ctrl", "Alt", "P"],    "Power menu"),
+        (["Ctrl", "Alt", "Del"],  "Exit Hyprland session"),
+        (["Mod", "N"],            "Toggle night light"),
+        (["Mod", "Shift", "N"],   "Toggle night-mode profile"),
+        (["Mod", "W"],            "Pick wallpaper"),
+        (["Mod", "Shift", "W"],   "Wallpaper effects"),
+        (["Mod", "L"],            "Theme switcher"),
+        (["Mod", "Shift", "E"],   "Quick settings"),
+        (["Mod", "Shift", "G"],   "Toggle game mode"),
+    ]
+    return _keys_page("KEYS · 5/5", "System &amp; misc", rows)
+
+
+def _keys_page(eyebrow: str, title: str, rows) -> Gtk.Widget:
+    def body():
+        wrap = vbox(14, "card")
+        wrap.set_size_request(820, -1)
+
+        for keys, desc in rows:
+            wrap.append(keyrow(keys, desc))
+        return wrap
+
+    return page_shell(eyebrow, title, body)
+
+
+def build_cheatsheet() -> Gtk.Widget:
+    def body():
+        wrap = vbox(20)
+        wrap.set_size_request(720, -1)
+
+        wrap.append(
+            label(
+                "You don't have to memorize any of this.",
+                "subtitle",
+            )
+        )
+
+        rows = vbox(14, "card")
+        rows.append(keyrow(["Mod", "H"], "Live cheat sheet — every bind, scrollable"))
+        rows.append(keyrow(["Mod", "Shift", "K"], "Fuzzy-search the keybinds"))
+        wrap.append(rows)
+
+        wrap.append(
+            label(
+                '<i>When in doubt, hit <span foreground="#b8d0ff">Mod + H</span>.</i>',
+                "tagline",
+            )
+        )
+        return wrap
+
+    return page_shell("ALWAYS AVAILABLE", "Cheat sheet anywhere", body)
+
+
+def build_goodbye() -> Gtk.Widget:
+    box = vbox(0)
+    box.set_valign(Gtk.Align.CENTER)
+    box.set_halign(Gtk.Align.CENTER)
+
+    logo = TriangleLogo(220)
+    logo.set_margin_bottom(20)
+    box.append(logo)
+
+    box.append(label("YOU'RE READY", "eyebrow"))
+    t = label("Welcome to glassyOS.", "title-small")
+    t.set_margin_top(10)
+    t.set_margin_bottom(20)
+    box.append(t)
+
+    box.append(
+        label(
+            'Type <span foreground="#b8d0ff" font_family="monospace">glassy-</span> '
+            "in any terminal and tab-complete to see every tool.",
+            "body-large",
+        )
+    )
+    hint = label(
+        '<span foreground="#6c7a96">Run <span foreground="#b8d0ff" font_family="monospace">glassy-onboard</span> any time to revisit this tour.</span>',
+        "body",
+    )
+    hint.set_margin_top(8)
+    box.append(hint)
+    return box
+
+
+# Tool slides built from TOOLS list
+def all_pages():
+    pages = [
+        build_welcome(),
+        build_philosophy(),
+        build_toolbox_overview(),
+    ]
+    for i, tool in enumerate(TOOLS):
+        pages.append(build_tool_page(i + 1, *tool))
+    pages += [
+        build_quickshell_widgets(),
+        build_waybar(),
+        build_keys_launch(),
+        build_keys_window(),
+        build_keys_workspace(),
+        build_keys_screenshot(),
+        build_keys_system(),
+        build_cheatsheet(),
+        build_goodbye(),
+    ]
+    return pages
+
+
+# ───── Window ────────────────────────────────────────────────────────
+class OnboardWindow(Adw.ApplicationWindow):
+    def __init__(self, app, force: bool):
+        super().__init__(application=app)
+        self.set_title("glassyOS · Welcome")
+        self.set_default_size(1280, 800)
+        self.fullscreen()
+        self.add_css_class("bg")
+        self._force = force
+
+        # ESC + arrow keys to navigate
+        kc = Gtk.EventControllerKey()
+        kc.connect("key-pressed", self._on_key)
+        self.add_controller(kc)
+
+        outer = vbox(0)
+        self.set_content(outer)
+
+        # Carousel (the slides)
+        self.carousel = Adw.Carousel()
+        self.carousel.set_vexpand(True)
+        self.carousel.set_hexpand(True)
+        self.carousel.set_spacing(0)
+        self.carousel.set_allow_scroll_wheel(True)
+
+        self._pages = all_pages()
+        # Wrap each page in a Revealer for entrance animation
+        self._revealers: list[Gtk.Revealer] = []
+        for i, p in enumerate(self._pages):
+            rev = Gtk.Revealer()
+            rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+            rev.set_transition_duration(550)
+            rev.set_child(p)
+            rev.set_hexpand(True)
+            rev.set_vexpand(True)
+            rev.set_reveal_child(i == 0)
+            self._revealers.append(rev)
+            self.carousel.append(rev)
+
+        outer.append(self.carousel)
+
+        # Bottom controls
+        bottom = hbox(0)
+        bottom.set_margin_start(40)
+        bottom.set_margin_end(40)
+        bottom.set_margin_top(16)
+        bottom.set_margin_bottom(28)
+
+        skip = Gtk.Button(label="Skip")
+        skip.add_css_class("ghost")
+        skip.connect("clicked", lambda *_: self._finish())
+        bottom.append(skip)
+
+        # spacer
+        spacer = Gtk.Box(hexpand=True)
+        bottom.append(spacer)
+
+        # dots
+        dots = Adw.CarouselIndicatorDots()
+        dots.set_carousel(self.carousel)
+        dots.set_valign(Gtk.Align.CENTER)
+        bottom.append(dots)
+
+        # spacer 2
+        spacer2 = Gtk.Box(hexpand=True)
+        bottom.append(spacer2)
+
+        self.next_btn = Gtk.Button(label="Get started  →")
+        self.next_btn.add_css_class("pill")
+        self.next_btn.connect("clicked", self._on_next_clicked)
+        bottom.append(self.next_btn)
+
+        outer.append(bottom)
+
+        self.carousel.connect("page-changed", self._on_page_changed)
+        # show entrance for first page
+        GLib.timeout_add(80, lambda: (self._revealers[0].set_reveal_child(True), False)[1])
+
+    def _on_page_changed(self, carousel, idx):
+        for i, rev in enumerate(self._revealers):
+            if i == idx:
+                rev.set_reveal_child(True)
+
+        if idx == len(self._pages) - 1:
+            self.next_btn.set_label("Done  ✓")
+        elif idx == 0:
+            self.next_btn.set_label("Get started  →")
+        else:
+            self.next_btn.set_label("Next  →")
+
+    def _on_next_clicked(self, *_):
+        idx = int(self.carousel.get_position())
+        if idx >= len(self._pages) - 1:
+            self._finish()
+        else:
+            self.carousel.scroll_to(self._revealers[idx + 1], True)
+
+    def _on_key(self, controller, keyval, keycode, state):
+        if keyval in (Gdk.KEY_Escape,):
+            self._finish()
+            return True
+        if keyval in (Gdk.KEY_Right, Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_Down):
+            idx = int(self.carousel.get_position())
+            if idx < len(self._pages) - 1:
+                self.carousel.scroll_to(self._revealers[idx + 1], True)
+            else:
+                self._finish()
+            return True
+        if keyval in (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_BackSpace):
+            idx = int(self.carousel.get_position())
+            if idx > 0:
+                self.carousel.scroll_to(self._revealers[idx - 1], True)
+            return True
+        return False
+
+    def _finish(self):
+        if not self._force:
+            try:
+                MARKER_DIR.mkdir(parents=True, exist_ok=True)
+                MARKER_FILE.write_text(datetime.now().isoformat() + "\n")
+            except OSError:
+                pass
+        self.close()
+
+
+class OnboardApp(Adw.Application):
+    def __init__(self, force: bool):
+        super().__init__(application_id="com.glassyos.Onboard")
+        self._force = force
+        self.connect("activate", self._on_activate)
+
+    def _on_activate(self, app):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        # Force dark for our overlay
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+
+        win = OnboardWindow(self, self._force)
+        win.present()
+
+
+# ───── CLI ───────────────────────────────────────────────────────────
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="glassy-onboard",
+        description="Animated GUI welcome tour for glassyOS.",
+    )
+    p.add_argument("--first-run", action="store_true",
+                   help="run only if the onboarding has never been completed")
+    p.add_argument("--force", action="store_true",
+                   help="run even if completed; do not write the marker")
+    p.add_argument("--reset", action="store_true",
+                   help="delete the completion marker and exit")
+    args = p.parse_args()
+
+    if args.reset:
+        try:
+            MARKER_FILE.unlink()
+            print("onboarding marker removed.")
+        except FileNotFoundError:
+            print("no marker to remove.")
+        return 0
+
+    if args.first_run and MARKER_FILE.exists():
+        return 0
+
+    app = OnboardApp(force=args.force)
+    return app.run([])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

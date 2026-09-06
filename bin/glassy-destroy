@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# glassy-destroy — deep-purge a package that won't uninstall cleanly.
+# Removes: package, its unique dependencies, configs, caches, user data,
+# autostart entries, desktop files, and leftovers in common locations.
+#
+# Safety:
+#   - Hard denylist of critical system packages
+#   - Default is dry-run (shows what would be removed)
+#   - Double confirmation (type package name to proceed)
+#   - Creates an undo-tarball of configs before deletion
+
+set -euo pipefail
+
+# ─── UI ────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""; C_DIM=""
+fi
+log()    { printf "%s[destroy]%s %s\n" "$C_CYAN"   "$C_RESET" "$*" >&2; }
+step()   { printf "\n%s▸ %s%s\n"        "$C_BOLD"  "$*" "$C_RESET" >&2; }
+ok()     { printf "%s[ok]%s %s\n"       "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn()   { printf "%s[warn]%s %s\n"     "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()    { printf "%s[error]%s %s\n"    "$C_RED"   "$C_RESET" "$*" >&2; }
+skull()  { printf "\n%s☠  %s  ☠%s\n\n"  "$C_RED$C_BOLD" "$*" "$C_RESET" >&2; }
+
+# ─── Denylist: these can NEVER be destroyed ────────────────────────────
+DENYLIST=(
+  # core
+  glibc linux linux-lts linux-zen linux-hardened
+  systemd systemd-sysvcompat systemd-libs
+  bash coreutils util-linux shadow grep sed gawk tar gzip xz zstd
+  filesystem glib2 glib2-docs
+  # package management
+  pacman pacman-contrib paru yay archlinux-keyring
+  # network / init
+  iproute2 iputils openssh openssl ca-certificates gnupg
+  # dbus / session
+  dbus dbus-broker
+  # essential libs
+  zlib libffi readline ncurses expat
+  # base meta-groups
+  base base-devel
+  # alternative shells
+  zsh fish
+)
+
+is_denied() {
+  local p="$1"
+  for d in "${DENYLIST[@]}"; do
+    [[ "$p" == "$d" ]] && return 0
+  done
+  if pacman -Qg base 2>/dev/null | awk '{print $2}' | grep -qx "$p"; then
+    return 0
+  fi
+  return 1
+}
+
+# ─── Usage ─────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+${C_BOLD}glassy-destroy${C_RESET} — deep package purge
+
+${C_RED}${C_BOLD}WARNING:${C_RESET} removes EVERYTHING belonging to a package.
+For normal uninstall use: ${C_BOLD}sudo pacman -Rns <package>${C_RESET}
+Only use this when a package refuses to uninstall cleanly.
+
+${C_BOLD}Usage:${C_RESET}
+  glassy-destroy                     interactive picker (fzf)
+  glassy-destroy <package>           show dry-run, ask for confirmation
+  glassy-destroy <name> --execute    actually destroy (double-confirmation)
+  glassy-destroy --list-denied       show protected system packages
+
+If a protected system package is targeted, the tool refuses.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)         usage; exit 0 ;;
+  --list-denied)
+    step "protected packages (cannot be destroyed)"
+    printf '  %s\n' "${DENYLIST[@]}"
+    log "+ all packages from the 'base' group"
+    exit 0 ;;
+esac
+
+EXECUTE=0
+PKG=""
+for arg in "$@"; do
+  case "$arg" in
+    --execute) EXECUTE=1 ;;
+    -*) err "unknown: $arg"; exit 1 ;;
+    *)  PKG="$arg" ;;
+  esac
+done
+
+# ─── Interactive pick if no package given ──────────────────────────────
+if [[ -z "$PKG" ]]; then
+  command -v fzf >/dev/null || { err "fzf required"; exit 1; }
+  step "installed packages — pick target"
+  PKG=$(pacman -Qqe | fzf --prompt="destroy > " \
+          --header="pick a package — it will be THOROUGHLY removed. Esc to cancel." \
+          --height=60% --layout=reverse --border) || exit 0
+fi
+
+[[ -z "$PKG" ]] && { log "no package picked"; exit 0; }
+
+# ─── Safety: denylist check ────────────────────────────────────────────
+if is_denied "$PKG"; then
+  skull "'$PKG' is a CRITICAL SYSTEM PACKAGE"
+  err "destroying it would make your system unusable."
+  err "glassy-destroy refuses for safety reasons."
+  log "see denylist: glassy-destroy --list-denied"
+  exit 1
+fi
+
+# ─── Check installed ───────────────────────────────────────────────────
+if ! pacman -Q "$PKG" >/dev/null 2>&1; then
+  err "'$PKG' is not installed"
+  log "did you mean one of these?"
+  pacman -Qq | grep -i "$PKG" | head -5 | sed 's/^/  /'
+  exit 1
+fi
+
+VERSION=$(pacman -Q "$PKG" | awk '{print $2}')
+step "target: ${C_BOLD}$PKG $VERSION${C_RESET}"
+
+# ─── Dry-run: collect what will be removed ─────────────────────────────
+step "analysis — what would be removed"
+
+# 1. Package files
+log "files owned by package:"
+pacman -Ql "$PKG" 2>/dev/null | awk '{print $2}' | head -20 | sed 's/^/  /'
+PKG_FILE_COUNT=$(pacman -Ql "$PKG" 2>/dev/null | wc -l)
+log "(total: $PKG_FILE_COUNT files)"
+
+# 2. Orphaned deps
+log "dependencies only '$PKG' needs (will be removed too):"
+DEPS=$(pacman -Rcs --print-format '%n' "$PKG" 2>/dev/null | grep -v "^$PKG$" || true)
+if [[ -n "$DEPS" ]]; then
+  echo "$DEPS" | sed 's/^/  /'
+else
+  log "  (none)"
+fi
+
+# 3. User-space leftovers
+log "user data and configs (heuristic):"
+declare -a USER_PATHS=()
+candidates=(
+  "$HOME/.config/$PKG"
+  "$HOME/.config/$PKG"*
+  "$HOME/.local/share/$PKG"
+  "$HOME/.local/share/$PKG"*
+  "$HOME/.cache/$PKG"
+  "$HOME/.cache/$PKG"*
+  "$HOME/.$PKG"
+  "$HOME/.local/share/applications/$PKG"*.desktop
+  "$HOME/.config/autostart/$PKG"*.desktop
+)
+for p in "${candidates[@]}"; do
+  for expanded in $p; do
+    [[ -e "$expanded" ]] && USER_PATHS+=("$expanded")
+  done
+done
+if (( ${#USER_PATHS[@]} > 0 )); then
+  mapfile -t USER_PATHS < <(printf '%s\n' "${USER_PATHS[@]}" | sort -u)
+  printf '  %s\n' "${USER_PATHS[@]}"
+else
+  log "  (no user files found)"
+fi
+
+# 4. System config / cache leftovers
+declare -a SYS_PATHS=()
+sys_candidates=(
+  "/etc/$PKG" "/etc/$PKG.d" "/etc/$PKG.conf"
+  "/var/lib/$PKG" "/var/log/$PKG" "/var/cache/$PKG"
+  "/opt/$PKG"
+  "/usr/share/$PKG"
+)
+for p in "${sys_candidates[@]}"; do
+  [[ -e "$p" ]] && SYS_PATHS+=("$p")
+done
+if (( ${#SYS_PATHS[@]} > 0 )); then
+  log "system-level leftovers:"
+  printf '  %s\n' "${SYS_PATHS[@]}"
+fi
+
+# 5. systemd units
+SYSTEMD_UNITS=$(pacman -Ql "$PKG" 2>/dev/null | grep -oE '/usr/lib/systemd/(system|user)/[^ ]+\.(service|socket|timer|target)' | sort -u || true)
+if [[ -n "$SYSTEMD_UNITS" ]]; then
+  log "systemd units (will be stopped first):"
+  echo "$SYSTEMD_UNITS" | sed 's/^/  /'
+fi
+
+# ─── Dry-run complete ──────────────────────────────────────────────────
+if [[ "$EXECUTE" -eq 0 ]]; then
+  echo
+  warn "DRY-RUN — nothing was deleted."
+  log "to actually destroy:"
+  log "  ${C_BOLD}glassy-destroy $PKG --execute${C_RESET}"
+  exit 0
+fi
+
+# ─── Execute: final confirmation ───────────────────────────────────────
+skull "DESTRUCTION MODE"
+warn "package '$PKG' and ALL data listed above will be removed."
+warn "this CANNOT be undone (except via config backup)."
+read -rp "type the package name to confirm: " confirm_name
+if [[ "$confirm_name" != "$PKG" ]]; then
+  err "name does not match. aborting."
+  exit 1
+fi
+
+# ─── Backup configs before deletion ────────────────────────────────────
+BACKUP_DIR="$HOME/.local/share/glassy/destroy-undo"
+mkdir -p "$BACKUP_DIR"
+BACKUP_FILE="$BACKUP_DIR/${PKG}-$(date +%Y%m%d-%H%M%S).tar.gz"
+step "backing up configs (for rollback) → $BACKUP_FILE"
+backup_paths=()
+for p in "${USER_PATHS[@]}" "${SYS_PATHS[@]}"; do
+  [[ -e "$p" ]] && backup_paths+=("$p")
+done
+if (( ${#backup_paths[@]} > 0 )); then
+  tar czf "$BACKUP_FILE" "${backup_paths[@]}" 2>/dev/null || warn "backup partially incomplete"
+  ok "backup created"
+else
+  log "(no configs to back up)"
+fi
+
+# ─── Stop systemd units ────────────────────────────────────────────────
+if [[ -n "$SYSTEMD_UNITS" ]]; then
+  step "stopping systemd units"
+  while IFS= read -r unit; do
+    name=$(basename "$unit")
+    if [[ "$unit" == */system/* ]]; then
+      sudo systemctl disable --now "$name" 2>/dev/null || true
+    else
+      systemctl --user disable --now "$name" 2>/dev/null || true
+    fi
+  done <<< "$SYSTEMD_UNITS"
+fi
+
+# ─── Kill running processes from this package ──────────────────────────
+step "killing running processes"
+pkg_bins=$(pacman -Ql "$PKG" 2>/dev/null | awk '$2 ~ /\/bin\/|\/sbin\// {print $2}')
+killed_any=0
+while IFS= read -r bin; do
+  name=$(basename "$bin")
+  if pgrep -x "$name" >/dev/null 2>&1; then
+    log "killing: $name"
+    pkill -x "$name" 2>/dev/null || sudo pkill -x "$name" 2>/dev/null || true
+    killed_any=1
+  fi
+done <<< "$pkg_bins"
+[[ "$killed_any" -eq 0 ]] && log "(no running processes)"
+
+# ─── pacman removal (with cascade + configs) ───────────────────────────
+step "pacman removal with cascade"
+if ! sudo pacman -Rns --noconfirm "$PKG"; then
+  warn "pacman -Rns failed — trying -Rdd (skip dep-check)"
+  sudo pacman -Rdd --noconfirm "$PKG" || err "pacman could not remove package"
+fi
+
+# ─── User-level leftovers ──────────────────────────────────────────────
+step "deleting user files"
+for p in "${USER_PATHS[@]}"; do
+  rm -rf -- "$p" && log "✗ $p"
+done
+
+# ─── System-level leftovers ────────────────────────────────────────────
+if (( ${#SYS_PATHS[@]} > 0 )); then
+  step "deleting system leftovers"
+  for p in "${SYS_PATHS[@]}"; do
+    sudo rm -rf -- "$p" && log "✗ $p"
+  done
+fi
+
+# ─── Desktop file cache refresh ────────────────────────────────────────
+command -v update-desktop-database >/dev/null && \
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+
+# ─── Final verification ────────────────────────────────────────────────
+step "verification"
+if pacman -Q "$PKG" >/dev/null 2>&1; then
+  err "package is still installed — something went wrong"
+  exit 1
+else
+  ok "'$PKG' completely removed ✓"
+fi
+
+if command -v "$PKG" >/dev/null 2>&1; then
+  warn "command '$PKG' is still in PATH: $(command -v "$PKG") — check manually"
+fi
+
+echo
+ok "done. rollback backup if needed: $BACKUP_FILE"

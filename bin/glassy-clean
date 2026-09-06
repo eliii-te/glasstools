@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# glassy-clean — interactive cleanup for glassyOS
+# Removes orphans, old caches, broken symlinks, incomplete builds.
+
+set -euo pipefail
+
+# ─── UI ────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_BLUE=$'\033[34m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'; C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""; C_DIM=""
+fi
+log()  { printf "%s[glassy]%s %s\n" "$C_CYAN"   "$C_RESET" "$*" >&2; }
+step() { printf "\n%s▸ %s%s\n"       "$C_BOLD"  "$*" "$C_RESET" >&2; }
+ok()   { printf "%s[ok]%s %s\n"      "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn() { printf "%s[warn]%s %s\n"    "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()  { printf "%s[error]%s %s\n"   "$C_RED"   "$C_RESET" "$*" >&2; }
+
+AUTO=0
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes)  AUTO=1 ;;
+    -h|--help)
+      cat <<EOF
+${C_BOLD}glassy-clean${C_RESET} — interactive cleanup
+
+Removes: orphaned packages, old cache files, incomplete AUR builds,
+broken symlinks, unused flatpak runtimes. Always asks before deleting.
+
+${C_BOLD}Usage:${C_RESET}  glassy-clean [-y|--yes]
+  --yes    auto-confirm every step (be careful)
+EOF
+      exit 0 ;;
+  esac
+done
+
+confirm() {
+  [[ "$AUTO" -eq 1 ]] && return 0
+  local prompt="$1"
+  read -rp "$(printf "%s%s%s [y/N] " "$C_BOLD" "$prompt" "$C_RESET")" r
+  [[ "$r" =~ ^[Yy]$ ]]
+}
+
+size_of() {
+  du -sh "$1" 2>/dev/null | cut -f1
+}
+
+# ─── 1. Orphaned packages ──────────────────────────────────────────────
+step "orphaned packages (dependencies no longer needed)"
+orphans=$(pacman -Qdtq 2>/dev/null || true)
+if [[ -z "$orphans" ]]; then
+  ok "no orphans"
+else
+  count=$(echo "$orphans" | wc -l)
+  log "$count orphan package(s):"
+  echo "$orphans" | sed 's/^/  /' | head -20
+  [[ $count -gt 20 ]] && log "… and $((count-20)) more"
+  if confirm "remove these orphans (safe — they're not needed anymore)?"; then
+    # shellcheck disable=SC2086
+    sudo pacman -Rns $orphans
+    ok "orphans removed"
+  fi
+fi
+
+# ─── 2. Pacman cache ───────────────────────────────────────────────────
+step "pacman package cache"
+if ! command -v paccache >/dev/null; then
+  warn "paccache missing (part of pacman-contrib)"
+  if confirm "install pacman-contrib now?"; then
+    sudo pacman -S --needed pacman-contrib
+  fi
+fi
+
+if command -v paccache >/dev/null; then
+  cache_size=$(size_of /var/cache/pacman/pkg)
+  log "/var/cache/pacman/pkg is $cache_size"
+  log "dry-run — how much would be freed keeping last 3 versions:"
+  paccache -dk3 2>&1 | tail -5
+  if confirm "remove old versions (keeps last 3)?"; then
+    sudo paccache -rk3
+  fi
+  if confirm "also remove cache for uninstalled packages?"; then
+    sudo paccache -ruk0
+  fi
+fi
+
+# ─── 3. AUR helper cache ───────────────────────────────────────────────
+step "AUR helper cache"
+if command -v paru >/dev/null; then
+  paru_cache="$HOME/.cache/paru"
+  [[ -d "$paru_cache" ]] && log "paru cache: $(size_of "$paru_cache")"
+  if confirm "run 'paru -Sc' (clean build cache)?"; then
+    paru -Sc
+  fi
+elif command -v yay >/dev/null; then
+  yay_cache="$HOME/.cache/yay"
+  [[ -d "$yay_cache" ]] && log "yay cache: $(size_of "$yay_cache")"
+  if confirm "run 'yay -Sc' (clean build cache)?"; then
+    yay -Sc
+  fi
+else
+  ok "no AUR helper installed"
+fi
+
+# ─── 4. Incomplete/failed AUR builds ───────────────────────────────────
+step "incomplete AUR builds (leftover src/ pkg/ from failed makepkg)"
+for base in "$HOME/.cache/paru/clone" "$HOME/.cache/yay"; do
+  [[ -d "$base" ]] || continue
+  mapfile -t leftovers < <(find "$base" -maxdepth 2 \( -name src -o -name pkg \) -type d 2>/dev/null)
+  if (( ${#leftovers[@]} > 0 )); then
+    log "found ${#leftovers[@]} leftover build dir(s) in $base:"
+    printf '  %s\n' "${leftovers[@]}" | head -10
+    if confirm "delete these incomplete build dirs?"; then
+      for d in "${leftovers[@]}"; do rm -rf "$d"; done
+      ok "removed"
+    fi
+  else
+    ok "no incomplete builds in $base"
+  fi
+done
+
+# ─── 5. Partial downloads ──────────────────────────────────────────────
+step "partial downloads (*.part files)"
+partial=$(find "$HOME" /var/cache -maxdepth 5 -name '*.part' -o -name '*.crdownload' 2>/dev/null || true)
+if [[ -n "$partial" ]]; then
+  log "partial download files:"
+  echo "$partial" | head -20 | sed 's/^/  /'
+  if confirm "delete these partial downloads?"; then
+    echo "$partial" | xargs rm -f
+  fi
+else
+  ok "no partial downloads"
+fi
+
+# ─── 6. User cache ─────────────────────────────────────────────────────
+step "user cache (~/.cache)"
+cache_total=$(size_of "$HOME/.cache")
+log "~/.cache total: $cache_total"
+log "largest cache directories:"
+du -h -d 1 "$HOME/.cache" 2>/dev/null | sort -hr | head -8 | sed 's/^/  /'
+
+if confirm "delete files in ~/.cache older than 30 days?"; then
+  find "$HOME/.cache" -type f -atime +30 -delete 2>/dev/null || true
+  find "$HOME/.cache" -type d -empty -delete 2>/dev/null || true
+  ok "old cache files removed"
+fi
+
+# ─── 7. Thumbnail cache ────────────────────────────────────────────────
+step "thumbnail cache"
+thumb="$HOME/.cache/thumbnails"
+if [[ -d "$thumb" ]]; then
+  log "thumbnails: $(size_of "$thumb")"
+  if confirm "clear thumbnail cache?"; then
+    rm -rf "$thumb"/*
+    ok "thumbnails cleared"
+  fi
+fi
+
+# ─── 8. Systemd journal ────────────────────────────────────────────────
+step "systemd journal logs"
+journal_size=$(journalctl --disk-usage 2>&1 | grep -oP '[0-9.]+\s*\w+' | head -1 || echo "?")
+log "journal: $journal_size"
+if confirm "trim journal to last 2 weeks?"; then
+  sudo journalctl --vacuum-time=2weeks
+fi
+
+# ─── 9. Flatpak ────────────────────────────────────────────────────────
+if command -v flatpak >/dev/null; then
+  step "flatpak unused runtimes"
+  if confirm "run 'flatpak uninstall --unused'?"; then
+    flatpak uninstall --unused -y
+  fi
+fi
+
+# ─── 10. Broken symlinks ───────────────────────────────────────────────
+step "broken symlinks in common user dirs"
+for t in "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.config"; do
+  [[ -d "$t" ]] || continue
+  mapfile -t broken < <(find "$t" -xtype l 2>/dev/null)
+  if (( ${#broken[@]} > 0 )); then
+    log "broken symlinks in $t:"
+    printf '  %s\n' "${broken[@]}" | head -10
+    if confirm "remove these broken links?"; then
+      for l in "${broken[@]}"; do rm -f "$l"; done
+    fi
+  fi
+done
+
+# ─── 11. Trash ─────────────────────────────────────────────────────────
+step "trash"
+trash="$HOME/.local/share/Trash"
+if [[ -d "$trash" ]]; then
+  ts=$(size_of "$trash")
+  log "trash: $ts"
+  if confirm "empty trash?"; then
+    rm -rf "$trash/files"/* "$trash/info"/*
+    ok "trash emptied"
+  fi
+fi
+
+# ─── Summary ───────────────────────────────────────────────────────────
+echo
+ok "glassy-clean finished."
+df -h / /home 2>/dev/null | head -3

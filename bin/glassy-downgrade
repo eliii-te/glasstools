@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""
+glassy-downgrade — interactive TUI for rolling parts of GlassyOS / Arch
+back to an earlier state. Companion to glassy-update.
+
+This is a power-user tool: rewinding a rolling-release system can break
+package signatures, leave dangling deps, and confuse pacman's database.
+The UI loudly warns about it but does not stop you — that's the point.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+VERSION = "ALPHA:0.1"
+
+# ───── Paths ─────────────────────────────────────────────────────────
+HOME = Path.home()
+USER_BACKUP_ROOT = HOME / ".local/share/glassy/backups"
+USER_CONFIG_DIR = HOME / ".config/glassy"
+USER_CONFIG_FILE = USER_CONFIG_DIR / "updater.conf"
+GLASSY_VERSION_FILE = Path("/etc/glassyos-release")
+PACMAN_CACHE = Path("/var/cache/pacman/pkg")
+MIRRORLIST = Path("/etc/pacman.d/mirrorlist")
+ARCH_ARCHIVE_BASE = "https://archive.archlinux.org/repos"
+
+
+def _writable_or(root: Path, fallback: Path) -> Path:
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".probe"
+        probe.touch()
+        probe.unlink()
+        return root
+    except (PermissionError, OSError):
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+BACKUP_ROOT = _writable_or(Path("/var/lib/glassyos/backups"), USER_BACKUP_ROOT)
+
+
+# ───── Theme — red/danger palette ────────────────────────────────────
+class C:
+    RED   = "\033[38;2;255;90;90m"
+    BLOOD = "\033[38;2;200;40;50m"
+    EMBER = "\033[38;2;255;140;100m"
+    BONE  = "\033[38;2;232;232;232m"
+    DIM   = "\033[38;2;130;110;115m"
+    DEEP  = "\033[38;2;90;60;70m"
+    OK    = "\033[38;2;132;220;160m"
+    WARN  = "\033[38;2;255;200;120m"
+    ERR   = "\033[38;2;255;120;120m"
+    BOLD  = "\033[1m"
+    DIM2  = "\033[2m"
+    ITAL  = "\033[3m"
+    RST   = "\033[0m"
+    HIDE  = "\033[?25l"
+    SHOW  = "\033[?25h"
+    CLR   = "\033[2J\033[H"
+    EOL   = "\033[K"
+
+
+def supports_tty() -> bool:
+    return sys.stdout.isatty() and sys.stdin.isatty()
+
+
+# ───── Logo — circled down-arrow in red ──────────────────────────────
+LOGO = [
+    "      ╭───────╮      ",
+    "    ╱     │     ╲    ",
+    "   │      │      │   ",
+    "   │      │      │   ",
+    "   │     ▼▼▼     │   ",
+    "    ╲     ▼     ╱    ",
+    "      ╰───────╯      ",
+]
+
+
+# ───── Terminal helpers ──────────────────────────────────────────────
+def term_size() -> tuple[int, int]:
+    try:
+        sz = shutil.get_terminal_size((100, 30))
+        return sz.columns, sz.lines
+    except OSError:
+        return 100, 30
+
+
+def write(*parts: str) -> None:
+    sys.stdout.write("".join(parts))
+    sys.stdout.flush()
+
+
+def move(row: int, col: int) -> str:
+    return f"\033[{row};{col}H"
+
+
+def center_pad(text: str, width: int) -> str:
+    visible = re.sub(r"\033\[[0-9;]*m", "", text)
+    pad = max(0, (width - len(visible)) // 2)
+    return " " * pad + text
+
+
+class RawMode:
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+
+def read_key() -> str:
+    """Single-key read via os.read so Python's text buffer can't eat escape tails."""
+    import select
+    fd = sys.stdin.fileno()
+    b = os.read(fd, 1)
+    if not b:
+        return ""
+    ch = b.decode("utf-8", errors="replace")
+    if ch == "\x1b":
+        if select.select([fd], [], [], 0.08)[0]:
+            rest = os.read(fd, 8).decode("utf-8", errors="replace")
+            if rest.startswith("[A"): return "UP"
+            if rest.startswith("[B"): return "DOWN"
+            if rest.startswith("[C"): return "RIGHT"
+            if rest.startswith("[D"): return "LEFT"
+            return "ESC"
+        return "ESC"
+    if ch in ("\r", "\n"): return "ENTER"
+    if ch == "\t": return "TAB"
+    if ch in ("\x7f", "\b"): return "BACK"
+    if ch == "\x03": raise KeyboardInterrupt()
+    return ch
+
+
+# ───── Splash ────────────────────────────────────────────────────────
+def splash() -> None:
+    if not supports_tty():
+        return
+    cols, rows = term_size()
+    write(C.CLR, C.HIDE)
+    block_h = len(LOGO) + 6
+    top = max(2, (rows - block_h) // 2)
+
+    palette = [C.DEEP, C.BLOOD, C.RED, C.EMBER, C.RED, C.BLOOD]
+    for i, line in enumerate(LOGO):
+        for shade in palette:
+            write(move(top + i, 1), C.EOL, center_pad(f"{shade}{line}{C.RST}", cols))
+            time.sleep(0.012)
+        write(move(top + i, 1), C.EOL, center_pad(f"{C.RED}{line}{C.RST}", cols))
+        time.sleep(0.022)
+
+    time.sleep(0.18)
+
+    title = "GlassyOS  downgrade  console"
+    title_y = top + len(LOGO) + 2
+    write(move(title_y, 1), C.EOL)
+    pad = max(0, (cols - len(title)) // 2)
+    write(" " * pad)
+    for ch in title:
+        write(f"{C.BOLD}{C.BONE}{ch}{C.RST}")
+        time.sleep(0.018)
+
+    ver = f"·  ver: {VERSION}  ·  rolling things back  ·"
+    write(move(title_y + 1, 1), C.EOL)
+    pad2 = max(0, (cols - len(ver)) // 2)
+    write(" " * pad2)
+    for ch in ver:
+        write(f"{C.EMBER}{ch}{C.RST}")
+        time.sleep(0.012)
+
+    time.sleep(0.45)
+    hint = "press any key to continue"
+    write(move(title_y + 3, 1), C.EOL,
+          center_pad(f"{C.DIM2}{C.DIM}{hint}{C.RST}", cols))
+    sys.stdout.flush()
+    with RawMode():
+        read_key()
+    write(C.CLR)
+
+
+# ───── Chrome ────────────────────────────────────────────────────────
+def render_chrome(title: str, subtitle: str = "") -> int:
+    cols, _ = term_size()
+    write(C.CLR)
+    bar = "─" * max(0, cols - 4)
+    write(move(1, 1), f"{C.DIM}╭{bar}╮{C.RST}")
+    head = (f" {C.BOLD}{C.BONE}GlassyOS{C.RST}  "
+            f"{C.RED}downgrade console{C.RST}  "
+            f"{C.EMBER}·  {VERSION}{C.RST} ")
+    head_visible = re.sub(r"\033\[[0-9;]*m", "", head)
+    write(move(2, 1),
+          f"{C.DIM}│{C.RST}{head}{' ' * max(0, cols - 2 - len(head_visible))}{C.DIM}│{C.RST}")
+    write(move(3, 1), f"{C.DIM}├{bar}┤{C.RST}")
+    write(move(4, 3), f"{C.BOLD}{C.RED}{title}{C.RST}")
+    if subtitle:
+        write(move(5, 3), f"{C.DIM}{subtitle}{C.RST}")
+        return 7
+    return 6
+
+
+def footer(text: str) -> None:
+    cols, rows = term_size()
+    bar = "─" * max(0, cols - 4)
+    write(move(rows - 2, 1), f"{C.DIM}╰{bar}╯{C.RST}")
+    write(move(rows - 1, 3), f"{C.DIM}{text}{C.RST}{C.EOL}")
+
+
+def print_header(title: str, subtitle: str = "") -> None:
+    write(C.SHOW, C.CLR)
+    cols, _ = term_size()
+    bar = "─" * max(0, cols - 4)
+    write(f"{C.DIM}╭{bar}╮{C.RST}\n")
+    write(f"{C.DIM}│{C.RST}  {C.BOLD}{C.RED}{title}{C.RST}\n")
+    if subtitle:
+        write(f"{C.DIM}│{C.RST}  {C.DIM}{subtitle}{C.RST}\n")
+    write(f"{C.DIM}╰{bar}╯{C.RST}\n\n")
+
+
+def info(msg: str)  -> None: write(f"  {C.RED}▸{C.RST} {msg}\n")
+def ok(msg: str)    -> None: write(f"  {C.OK}✓{C.RST} {msg}\n")
+def warn(msg: str)  -> None: write(f"  {C.WARN}!{C.RST} {msg}\n")
+def err(msg: str)   -> None: write(f"  {C.ERR}✗{C.RST} {msg}\n")
+
+
+def pause(prompt: str = "press any key to return to the menu") -> None:
+    write(f"\n  {C.DIM2}{C.DIM}{prompt}{C.RST}\n")
+    sys.stdout.flush()
+    with RawMode():
+        try: read_key()
+        except KeyboardInterrupt: pass
+
+
+def run_cmd(cmd, allow_fail: bool = False) -> int:
+    pretty = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+    write(f"  {C.DEEP}$ {pretty}{C.RST}\n")
+    try:
+        return subprocess.run(cmd).returncode
+    except FileNotFoundError:
+        err(f"command not found: {cmd[0] if isinstance(cmd, list) else cmd}")
+        return 127
+    except KeyboardInterrupt:
+        warn("interrupted")
+        return 130
+
+
+# ───── Backup ────────────────────────────────────────────────────────
+def make_snapshot(reason: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    snap = BACKUP_ROOT / f"{ts}-down-{reason}"
+    snap.mkdir(parents=True, exist_ok=True)
+    info(f"snapshot at {snap}")
+
+    for name, cmd in [
+        ("pkglist-explicit.txt", ["pacman", "-Qqe"]),
+        ("pkglist-aur.txt", ["pacman", "-Qqm"]),
+        ("pkglist-versioned.txt", ["pacman", "-Q"]),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            (snap / name).write_text(r.stdout)
+        except FileNotFoundError:
+            pass
+    if MIRRORLIST.exists():
+        try: shutil.copy2(MIRRORLIST, snap / "mirrorlist")
+        except OSError: pass
+    if GLASSY_VERSION_FILE.exists():
+        try: shutil.copy2(GLASSY_VERSION_FILE, snap / "glassyos-release")
+        except OSError: pass
+
+    try:
+        snaps = sorted(BACKUP_ROOT.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in snaps[15:]:
+            shutil.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
+    ok("snapshot saved")
+    return snap
+
+
+# ───── Confirmation ──────────────────────────────────────────────────
+def confirm(question: str, danger: bool = False) -> bool:
+    """Yes/No prompt. Defaults to NO. Requires typing 'yes' if danger=True."""
+    write(C.SHOW)
+    if danger:
+        write(f"\n  {C.BOLD}{C.RED}{question}{C.RST}\n")
+        write(f"  {C.DIM}type 'yes' to continue, anything else to cancel:{C.RST} ")
+        try:
+            ans = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans == "yes"
+    else:
+        write(f"\n  {C.BOLD}{C.RED}{question}{C.RST} {C.DIM}[y/N]{C.RST} ")
+        try:
+            ans = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("y", "yes")
+
+
+# ───── Generic arrow-key picker ──────────────────────────────────────
+def pick_from(items: list[tuple[str, str]], title: str, subtitle: str = "") -> str | None:
+    """items = [(key, label), ...]. Returns key, or None on cancel."""
+    if not items:
+        return None
+    selected = 0
+    write(C.HIDE)
+    while True:
+        content_start = render_chrome(title, subtitle)
+        cols, rows = term_size()
+        max_rows = rows - content_start - 4
+        # window around selected
+        window_start = max(0, min(selected - max_rows // 2, len(items) - max_rows))
+        window_start = max(0, window_start)
+        for vi, idx in enumerate(range(window_start, min(len(items), window_start + max_rows))):
+            row = content_start + vi
+            key, label = items[idx]
+            if idx == selected:
+                write(move(row, 3), f"{C.EMBER}▶{C.RST} {C.BOLD}{C.BONE}{label}{C.RST}{C.EOL}")
+            else:
+                write(move(row, 3), f"  {C.DEEP}{label}{C.RST}{C.EOL}")
+        if len(items) > max_rows:
+            footer(f"↑↓ Enter  ·  Esc/q cancel  ·  {selected + 1}/{len(items)}")
+        else:
+            footer("↑↓ Enter  ·  Esc/q cancel")
+        sys.stdout.flush()
+        with RawMode():
+            try: key = read_key()
+            except KeyboardInterrupt: return None
+        if key == "UP":
+            selected = (selected - 1) % len(items)
+        elif key == "DOWN":
+            selected = (selected + 1) % len(items)
+        elif key == "ENTER":
+            return items[selected][0]
+        elif key in ("q",):
+            return None
+        elif key == "ESC":
+            continue
+
+
+# ───── System downgrade — Arch by archive date ───────────────────────
+def list_archive_dates(months: int = 24) -> list[tuple[str, str]]:
+    """Generate (YYYY/MM/DD, 'Mon DD, YYYY') list for the last N months,
+    one entry per Sunday + the 1st and 15th — keeps the picker manageable."""
+    out: list[tuple[str, str]] = []
+    today = date.today()
+    cutoff = today - timedelta(days=months * 30)
+    d = today
+    while d >= cutoff:
+        if d.weekday() == 6 or d.day in (1, 15):
+            iso = d.strftime("%Y/%m/%d")
+            label = d.strftime("%a, %b %d, %Y")
+            out.append((iso, label))
+        d -= timedelta(days=1)
+    return out
+
+
+def downgrade_arch_by_date() -> None:
+    print_header("Arch — rewind to archive snapshot",
+                 "Repoints pacman at archive.archlinux.org for a chosen date.")
+    info("the entire system will be reset to the package state from that date")
+    info("kernel, drivers, and graphics stack included — be ready to reboot afterwards")
+    write("\n")
+    if not confirm("Pick a date and rewind?", danger=False):
+        info("cancelled"); pause(); return
+
+    dates = list_archive_dates(24)
+    iso = pick_from(dates, "Choose archive snapshot date",
+                    "↑↓ to scroll through Sundays + 1st/15th of the last 24 months")
+    if not iso:
+        info("cancelled"); pause(); return
+
+    write(C.SHOW)
+    label = next(l for k, l in dates if k == iso)
+    write(C.CLR)
+    print_header(f"Confirm rewind to {label}",
+                 "This is a destructive cross-system operation.")
+    info(f"target archive:  {ARCH_ARCHIVE_BASE}/{iso}/")
+    info("snapshot of current state will be saved first")
+    if not confirm(f"Rewind ENTIRE SYSTEM to {label}? (this can break things)", danger=True):
+        info("cancelled"); pause(); return
+
+    make_snapshot(f"arch-{iso.replace('/', '')}")
+
+    info("writing new mirrorlist (single archive entry)")
+    new_mirror = (
+        f"# Set by glassy-downgrade on {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"# Snapshot date: {label}\n"
+        f"Server = {ARCH_ARCHIVE_BASE}/{iso}/$repo/os/$arch\n"
+    )
+    tmp = Path("/tmp/glassy-archive-mirrorlist")
+    tmp.write_text(new_mirror)
+    rc = run_cmd(["sudo", "install", "-m", "0644", str(tmp), str(MIRRORLIST)],
+                 allow_fail=True)
+    tmp.unlink(missing_ok=True)
+    if rc != 0:
+        err("could not write mirrorlist — aborting"); pause(); return
+
+    info("disabling SigLevel briefly so older signatures are accepted")
+    info("running:  sudo pacman -Syyuu  (downgrade to that snapshot)")
+    rc = run_cmd(["sudo", "pacman", "-Syyuu", "--noconfirm"], allow_fail=True)
+    if rc == 0:
+        ok(f"system rolled back to {label}")
+        warn("you are now pinned to that archive — run glassy-update later "
+             "to roll forward, or restore the mirrorlist from your snapshot")
+    else:
+        err(f"pacman exited with {rc}")
+        warn(f"restore mirrorlist with:  sudo cp {BACKUP_ROOT}/<latest>/mirrorlist {MIRRORLIST}")
+    pause()
+
+
+# ───── System downgrade — GlassyOS by past release ───────────────────
+def load_glassy_versions() -> list[tuple[str, str]]:
+    """Read past releases from updater config — looks for releases_catalog_url
+    or local manifest-*.json files in ~/.local/share/glassy/releases."""
+    out: list[tuple[str, str]] = []
+
+    # Local manifests first
+    rel_dir = HOME / ".local/share/glassy/releases"
+    if rel_dir.is_dir():
+        for f in sorted(rel_dir.glob("manifest-*.json"), reverse=True):
+            try:
+                m = json.loads(f.read_text())
+                v = m.get("version", "?")
+                built = m.get("built_at", "?")
+                out.append((str(f), f"{v}  —  built {built}  (local)"))
+            except (OSError, json.JSONDecodeError):
+                continue
+
+    # Remote catalog
+    cfg_url = ""
+    if USER_CONFIG_FILE.exists():
+        for line in USER_CONFIG_FILE.read_text().splitlines():
+            if line.strip().startswith("releases_catalog_url"):
+                _, v = line.split("=", 1)
+                cfg_url = v.strip().strip('"').strip("'")
+                break
+    if cfg_url:
+        try:
+            with urllib.request.urlopen(cfg_url, timeout=15) as r:
+                catalog = json.loads(r.read().decode())
+            for entry in catalog.get("releases", []):
+                v = entry.get("version", "?")
+                built = entry.get("built_at", "?")
+                man = entry.get("manifest_url", "")
+                if man:
+                    out.append((man, f"{v}  —  built {built}  (remote)"))
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as e:
+            warn(f"could not load releases catalog: {e}")
+    return out
+
+
+def downgrade_glassyos() -> None:
+    print_header("GlassyOS — install an older release",
+                 "Pulls a previous release manifest and re-applies it.")
+    versions = load_glassy_versions()
+    if not versions:
+        warn("no GlassyOS releases found")
+        info("local releases live in ~/.local/share/glassy/releases/manifest-*.json")
+        info(f"or set 'releases_catalog_url=' in {USER_CONFIG_FILE} to fetch a catalog")
+        pause(); return
+
+    pick = pick_from(versions, "Choose a GlassyOS release to install",
+                     "older versions appear lower in the list")
+    if not pick:
+        info("cancelled"); pause(); return
+
+    if not confirm("Install this release?  (current files will be overwritten)", danger=True):
+        info("cancelled"); pause(); return
+
+    make_snapshot("glassyos")
+
+    # pick is either a path (local manifest) or a URL
+    if pick.startswith("http"):
+        info(f"fetching {pick}")
+        try:
+            with urllib.request.urlopen(pick, timeout=20) as r:
+                manifest = json.loads(r.read().decode())
+        except Exception as e:
+            err(f"manifest fetch failed: {e}"); pause(); return
+    else:
+        try:
+            manifest = json.loads(Path(pick).read_text())
+        except Exception as e:
+            err(f"manifest read failed: {e}"); pause(); return
+
+    tar_url = manifest.get("tarball_url", "")
+    sha = manifest.get("sha256", "")
+    name = manifest.get("tarball_name") or Path(tar_url or "release.tar.zst").name
+    if not name:
+        err("manifest missing tarball name"); pause(); return
+
+    target = HOME / ".local/share/glassy/releases" / name
+    if tar_url and not tar_url.startswith("<") and not target.exists():
+        info(f"downloading {tar_url}")
+        try:
+            urllib.request.urlretrieve(tar_url, target)
+        except Exception as e:
+            err(f"download failed: {e}"); pause(); return
+
+    if not target.exists():
+        err(f"tarball not found and no usable download URL: {target}"); pause(); return
+
+    if sha:
+        import hashlib
+        info("verifying checksum")
+        if hashlib.sha256(target.read_bytes()).hexdigest() != sha:
+            err("checksum mismatch — refusing to install"); pause(); return
+        ok("checksum verified")
+
+    info("running release installer")
+    decomp = "unzstd" if target.suffix == ".zst" else "gzip -d"
+    rc = run_cmd(["sudo", "bash", "-c",
+                  f"tar --use-compress-program='{decomp}' -xf '{target}' -C / && "
+                  f"if [ -x /opt/glassyos/install.sh ]; then /opt/glassyos/install.sh; fi"],
+                 allow_fail=True)
+    if rc == 0:
+        ok(f"GlassyOS rolled back to {manifest.get('version', '?')}")
+    else:
+        err(f"installer exited with {rc}")
+    pause()
+
+
+# ───── system_downgrade dispatcher ───────────────────────────────────
+def action_system_downgrade() -> None:
+    write(C.SHOW, C.CLR)
+    cols, _ = term_size()
+    bar = "═" * max(0, cols - 4)
+    write(f"{C.RED}╔{bar}╗{C.RST}\n")
+    write(f"{C.RED}║{C.RST}  {C.BOLD}{C.RED}WARNING — SYSTEM DOWNGRADE{C.RST}\n")
+    write(f"{C.RED}╚{bar}╝{C.RST}\n\n")
+    write(f"  {C.BONE}This will roll your entire system back to an older state of either\n"
+          f"  Arch Linux or GlassyOS.{C.RST}\n\n")
+    write(f"  {C.WARN}Risks:{C.RST}\n"
+          f"    {C.DIM}·  AUR packages may break (they aren't versioned in the archive){C.RST}\n"
+          f"    {C.DIM}·  kernel/driver/firmware mismatch can prevent boot{C.RST}\n"
+          f"    {C.DIM}·  pacman db will reflect old versions; updates after this need attention{C.RST}\n"
+          f"    {C.DIM}·  encrypted home / secure-boot setups may need extra fixes{C.RST}\n\n")
+
+    if not confirm("Are you sure you want to downgrade your system?", danger=True):
+        info("cancelled — nothing changed"); pause(); return
+
+    sub = pick_from(
+        [
+            ("arch",  "Arch — pick a date and rewind via archive.archlinux.org"),
+            ("glassy", "GlassyOS — install a previous GlassyOS release"),
+            ("back",  "Cancel"),
+        ],
+        "What do you want to roll back?",
+        "browse Arch dates or older GlassyOS releases",
+    )
+    if sub == "arch":
+        downgrade_arch_by_date()
+    elif sub == "glassy":
+        downgrade_glassyos()
+    else:
+        info("cancelled"); pause()
+
+
+# ───── Specific package downgrade ────────────────────────────────────
+def list_pacman_cache_for(pkg: str) -> list[Path]:
+    if not PACMAN_CACHE.is_dir():
+        return []
+    out = []
+    for f in PACMAN_CACHE.glob(f"{pkg}-*.pkg.tar.*"):
+        # Filter signatures
+        if f.suffix == ".sig":
+            continue
+        # Confirm pkgname matches exactly (cache may contain pkg-foo and pkg-foo-extra)
+        m = re.match(rf"^{re.escape(pkg)}-([^-]+(?:-[^-]+)?)-(?:x86_64|any|i686)\.pkg\.tar\..+$", f.name)
+        if m:
+            out.append(f)
+    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def list_archive_versions_for(pkg: str, limit: int = 25) -> list[tuple[str, str]]:
+    """Scrape archive.archlinux.org/packages/<initial>/<pkg>/ for versions."""
+    initial = pkg[0].lower()
+    url = f"https://archive.archlinux.org/packages/{initial}/{pkg}/"
+    try:
+        with urllib.request.urlopen(url, timeout=12) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        return []
+    # Find .pkg.tar.* hrefs
+    files = re.findall(rf'href="({re.escape(pkg)}-[^"]+\.pkg\.tar\.\w+)"', html)
+    out: list[tuple[str, str]] = []
+    seen = set()
+    for f in files:
+        if f in seen: continue
+        seen.add(f)
+        out.append((url + f, f))
+    return out[:limit]
+
+
+def downgrade_specific() -> None:
+    print_header("Specific downgrade",
+                 "Pick one package, then pick which version to install.")
+    if not shutil.which("fzf"):
+        warn("fzf is not installed; install it with:  sudo pacman -S fzf")
+        pause(); return
+
+    info("listing installed packages — type to filter, Enter to pick, Esc to cancel")
+    pkgs = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True).stdout
+    try:
+        r = subprocess.run(
+            ["fzf", "--prompt=  pick a package > ", "--height=20",
+             "--reverse", "--border=rounded"],
+            input=pkgs, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        err("fzf launch failed"); pause(); return
+    pkg = r.stdout.strip()
+    if not pkg:
+        info("no package picked"); pause(); return
+
+    # current version
+    cur = subprocess.run(["pacman", "-Q", pkg], capture_output=True, text=True).stdout.strip()
+    info(f"current installed:  {C.BONE}{cur}{C.RST}")
+
+    # Sources
+    cache = list_pacman_cache_for(pkg)
+    info(f"cached versions on this machine: {len(cache)}")
+    info("fetching available versions from archive.archlinux.org…")
+    archive = list_archive_versions_for(pkg, 30)
+    info(f"archive versions: {len(archive)}")
+
+    items: list[tuple[str, str]] = []
+    for f in cache:
+        items.append((f"cache:{f}", f"{f.name}    {C.DIM}(cached){C.RST}"))
+    for url, name in archive:
+        items.append((f"archive:{url}", f"{name}    {C.DIM}(archive){C.RST}"))
+    if not items:
+        warn("no older versions found in cache or archive")
+        info("if this is an AUR package, the archive does not host it")
+        pause(); return
+
+    pick = pick_from(items, f"Pick a version of '{pkg}' to install",
+                     "cache entries are local; archive entries are downloaded first")
+    if not pick:
+        info("cancelled"); pause(); return
+
+    make_snapshot(f"pkg-{pkg}")
+
+    if pick.startswith("cache:"):
+        path = Path(pick[len("cache:"):])
+    else:
+        url = pick[len("archive:"):]
+        target = Path("/tmp") / Path(url).name
+        info(f"downloading {url}")
+        try:
+            urllib.request.urlretrieve(url, target)
+        except Exception as e:
+            err(f"download failed: {e}"); pause(); return
+        path = target
+
+    info(f"installing {path.name}")
+    rc = run_cmd(["sudo", "pacman", "-U", "--noconfirm", str(path)], allow_fail=True)
+    if rc == 0:
+        ok(f"{pkg} downgraded")
+        warn("consider adding to /etc/pacman.conf IgnorePkg if you want this version pinned:")
+        write(f"      {C.DIM}IgnorePkg = {pkg}{C.RST}\n")
+    else:
+        err(f"pacman exited with {rc}")
+    pause()
+
+
+# ───── Main menu ─────────────────────────────────────────────────────
+MENU_ITEMS = [
+    ("system", "System downgrade",
+     "installs an older version of arch  WARNING:THIS IS ABSOLUTELY NOT RECOMMENDED"),
+    ("specific", "Specific downgrade",
+     "downgrades selected packets, execute with attention"),
+    ("__sep__", "", ""),
+    ("exit", "Exit", "Leave the downgrade console."),
+]
+
+
+def main_menu() -> str:
+    selected = 0
+    write(C.HIDE)
+    while True:
+        write(C.HIDE)
+        cols, rows = term_size()
+        content_start = render_chrome("Choose a downgrade",
+                                      "↑↓ navigate  ·  Enter select  ·  q quit")
+        for i, (key, label, desc) in enumerate(MENU_ITEMS):
+            row = content_start + i
+            if key == "__sep__":
+                write(move(row, 5), f"{C.DIM}{'─' * 40}{C.RST}")
+                continue
+            if i == selected:
+                write(move(row, 3), f"{C.EMBER}▶{C.RST} {C.BOLD}{C.BONE}{label}{C.RST}")
+                write(move(row, 40), f"{C.DIM}{desc}{C.RST}{C.EOL}")
+            else:
+                write(move(row, 3), f"  {C.DEEP}{label}{C.RST}{C.EOL}")
+        footer("↑↓ Enter  ·  q quit")
+        sys.stdout.flush()
+
+        with RawMode():
+            try: key = read_key()
+            except KeyboardInterrupt: return "exit"
+
+        if key == "UP":
+            selected = (selected - 1) % len(MENU_ITEMS)
+            while MENU_ITEMS[selected][0] == "__sep__":
+                selected = (selected - 1) % len(MENU_ITEMS)
+        elif key == "DOWN":
+            selected = (selected + 1) % len(MENU_ITEMS)
+            while MENU_ITEMS[selected][0] == "__sep__":
+                selected = (selected + 1) % len(MENU_ITEMS)
+        elif key == "ENTER":
+            choice = MENU_ITEMS[selected][0]
+            if choice == "exit":
+                return "exit"
+            return choice
+        elif key == "q":
+            return "exit"
+        elif key == "ESC":
+            continue
+
+
+ACTIONS = {
+    "system":   action_system_downgrade,
+    "specific": downgrade_specific,
+}
+
+
+def main_loop() -> None:
+    splash()
+    while True:
+        choice = main_menu()
+        if choice == "exit":
+            write(C.CLR, f"{C.RED}  ▼  GlassyOS  ·  rolled back, see you soon{C.RST}\n\n")
+            return
+        fn = ACTIONS.get(choice)
+        if fn:
+            fn()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="glassy-downgrade",
+        description="Interactive TUI for rolling parts of GlassyOS / Arch back to an earlier state.",
+    )
+    p.add_argument("--version", action="version", version=f"glassy-downgrade {VERSION}")
+    p.add_argument("--no-splash", action="store_true", help="skip the intro animation")
+    p.add_argument("--system", action="store_true", help="run system downgrade non-interactively")
+    p.add_argument("--specific", action="store_true", help="run specific-package downgrade non-interactively")
+    args = p.parse_args()
+
+    if args.system and supports_tty():
+        try:
+            action_system_downgrade()
+        finally:
+            write(C.SHOW)
+        return 0
+    if args.specific and supports_tty():
+        try:
+            downgrade_specific()
+        finally:
+            write(C.SHOW)
+        return 0
+
+    if not supports_tty():
+        err("this is an interactive tool — run it from a real terminal")
+        return 1
+
+    try:
+        if args.no_splash:
+            while True:
+                choice = main_menu()
+                if choice == "exit":
+                    write(C.CLR); return 0
+                fn = ACTIONS.get(choice)
+                if fn:
+                    fn()
+        else:
+            main_loop()
+    except KeyboardInterrupt:
+        write(C.SHOW + "\n")
+        return 130
+    finally:
+        write(C.SHOW)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

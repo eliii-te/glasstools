@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# glassy-fix — automatic system health check and self-repair
+
+set -euo pipefail
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_RED=""; C_DIM=""
+fi
+
+log()   { printf "%s[fix]%s %s\n"    "$C_CYAN"         "$C_RESET" "$*" >&2; }
+step()  { printf "\n%s▸ %s%s\n"      "$C_BOLD"         "$*" "$C_RESET" >&2; }
+ok()    { printf "%s[ok]%s %s\n"     "$C_GREEN"        "$C_RESET" "$*" >&2; }
+warn()  { printf "%s[warn]%s %s\n"   "$C_YELLOW"       "$C_RESET" "$*" >&2; }
+err()   { printf "%s[error]%s %s\n"  "$C_RED"          "$C_RESET" "$*" >&2; }
+fixed() { printf "%s[fixed]%s %s\n"  "$C_GREEN$C_BOLD" "$C_RESET" "$*" >&2; }
+
+DRY=0
+FIXED=0
+WARNED=0
+
+for arg in "$@"; do
+  case "$arg" in
+    -n|--dry-run) DRY=1 ;;
+    -h|--help)
+      cat <<EOF
+${C_BOLD}glassy-fix${C_RESET} — automatic system repair
+
+Finds and fixes problems automatically:
+  • stale pacman lock files
+  • failed / dead user services that should be running
+  • failed system services (reset + restart)
+  • broken symlinks in user dirs
+  • config syntax errors (walker TOML, JSON)
+  • broken package dependencies
+  • unmerged .pacnew config files
+  • glassy suite services (elephant, walker, glassy-secure)
+
+${C_BOLD}Usage:${C_RESET}  glassy-fix [--dry-run]
+  --dry-run   show what would be fixed, change nothing
+EOF
+      exit 0 ;;
+    -*) err "unknown option: $arg"; exit 1 ;;
+  esac
+done
+
+# Execute or print in dry-run mode (supports shell expressions via bash -c)
+run() {
+  if [[ "$DRY" -eq 1 ]]; then
+    printf "%s[dry]%s %s\n" "$C_DIM" "$C_RESET" "$*" >&2
+  else
+    bash -c "$*"
+  fi
+}
+
+inc_fixed()  { FIXED=$(( FIXED + 1 )); }
+inc_warned() { WARNED=$(( WARNED + 1 )); }
+
+# ─── 1. Stale pacman lock ─────────────────────────────────────────────
+step "pacman lock"
+if [[ -f /var/lib/pacman/db.lck ]]; then
+  if pgrep -x pacman >/dev/null 2>&1; then
+    warn "pacman is currently running — lock is valid, leaving it"
+    inc_warned
+  else
+    warn "stale pacman lock (pacman not running)"
+    run "sudo rm -f /var/lib/pacman/db.lck"
+    fixed "removed stale lock"
+    inc_fixed
+  fi
+else
+  ok "no stale pacman lock"
+fi
+
+# ─── 2. Failed user services ──────────────────────────────────────────
+step "failed user services"
+failed_any=0
+while IFS= read -r svc; do
+  [[ -z "$svc" ]] && continue
+  warn "failed: $svc"
+  run "systemctl --user reset-failed '$svc' 2>/dev/null || true"
+  run "systemctl --user restart '$svc'"
+  if [[ "$DRY" -eq 1 ]]; then
+    inc_fixed
+  else
+    sleep 1
+    if systemctl --user is-active "$svc" >/dev/null 2>&1; then
+      fixed "restarted $svc"
+      inc_fixed
+    else
+      err "$svc still not active — check: journalctl --user -u $svc"
+      inc_warned
+    fi
+  fi
+  failed_any=1
+done < <(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+[[ "$failed_any" -eq 0 ]] && ok "no failed user services"
+
+# ─── 3. Enabled user services that should stay running but aren't ─────
+step "user services: enabled but not running"
+inactive_any=0
+while IFS= read -r svc; do
+  [[ -z "$svc" ]] && continue
+  [[ "$svc" == *"@.service" ]] && continue  # skip template stubs
+
+  # Only target services with an explicit Restart policy (meant to stay alive)
+  restart=$(systemctl --user show "$svc" -p Restart --value 2>/dev/null || echo "no")
+  case "$restart" in
+    always|on-failure|on-abnormal|on-abort|on-watchdog) ;;
+    *) continue ;;
+  esac
+
+  state=$(systemctl --user is-active "$svc" 2>/dev/null) || true
+  [[ "$state" == "active" ]] && continue
+
+  warn "should be running but is $state: $svc"
+  run "systemctl --user start '$svc'"
+  if [[ "$DRY" -eq 1 ]]; then
+    inc_fixed
+  else
+    sleep 1
+    new=$(systemctl --user is-active "$svc" 2>/dev/null || echo "inactive")
+    if [[ "$new" == "active" ]]; then
+      fixed "started $svc"
+      inc_fixed
+    else
+      err "could not start $svc — check: journalctl --user -u $svc"
+      inc_warned
+    fi
+  fi
+  inactive_any=1
+done < <(systemctl --user list-unit-files --state=enabled --type=service --no-legend --plain 2>/dev/null | awk '{print $1}')
+[[ "$inactive_any" -eq 0 ]] && ok "all persistent user services running"
+
+# ─── 4. Failed system services ────────────────────────────────────────
+step "failed system services"
+failed_sys_any=0
+while IFS= read -r svc; do
+  [[ -z "$svc" ]] && continue
+  warn "system service failed: $svc"
+  run "sudo systemctl reset-failed '$svc' 2>/dev/null || true"
+  run "sudo systemctl restart '$svc'"
+  if [[ "$DRY" -eq 1 ]]; then
+    inc_fixed
+  else
+    sleep 1
+    if systemctl is-active "$svc" >/dev/null 2>&1; then
+      fixed "restarted system service $svc"
+      inc_fixed
+    else
+      err "$svc still failed — check: journalctl -u $svc"
+      inc_warned
+    fi
+  fi
+  failed_sys_any=1
+done < <(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+[[ "$failed_sys_any" -eq 0 ]] && ok "no failed system services"
+
+# ─── 5. Broken symlinks ───────────────────────────────────────────────
+step "broken symlinks"
+broken_count=0
+for dir in "$HOME/.local/bin" "$HOME/.local/share/applications"; do
+  [[ -d "$dir" ]] || continue
+  while IFS= read -r link; do
+    warn "broken symlink: $link"
+    run "rm -f '$link'"
+    broken_count=$(( broken_count + 1 ))
+    inc_fixed
+  done < <(find "$dir" -xtype l 2>/dev/null)
+done
+[[ "$broken_count" -eq 0 ]] && ok "no broken symlinks"
+
+# ─── 6. Config validation ─────────────────────────────────────────────
+step "config validation"
+config_ok=1
+
+# Walker TOML
+walker_cfg="$HOME/.config/walker/config.toml"
+if [[ -f "$walker_cfg" ]]; then
+  if python3 -c "import tomllib, sys; tomllib.load(open(sys.argv[1],'rb'))" "$walker_cfg" 2>/dev/null; then
+    ok "walker config.toml: valid"
+  else
+    err "walker config.toml: TOML syntax error"
+    python3 -c "import tomllib, sys; tomllib.load(open(sys.argv[1],'rb'))" "$walker_cfg" 2>&1 | sed 's/^/  /'
+    config_ok=0
+    inc_warned
+  fi
+fi
+
+# Hyprland: all .conf files must be non-empty
+hypr_dir="$HOME/.config/hypr"
+if [[ -d "$hypr_dir" ]]; then
+  empty_hypr=0
+  while IFS= read -r f; do
+    if [[ ! -s "$f" ]]; then
+      warn "empty hyprland config: $f"
+      empty_hypr=$(( empty_hypr + 1 ))
+      inc_warned
+    fi
+  done < <(find "$hypr_dir" -name '*.conf' 2>/dev/null)
+  [[ "$empty_hypr" -eq 0 ]] && ok "hyprland configs: all non-empty"
+fi
+
+# JSON configs in known app dirs
+json_dirs=(
+  "$HOME/.config/nvim"
+  "$HOME/.config/Code"
+  "$HOME/.config/Code - OSS"
+  "$HOME/.config/discord"
+)
+json_errors=0
+for d in "${json_dirs[@]}"; do
+  [[ -d "$d" ]] || continue
+  while IFS= read -r jf; do
+    if ! python3 -m json.tool "$jf" >/dev/null 2>&1; then
+      err "JSON syntax error: $jf"
+      json_errors=$(( json_errors + 1 ))
+      inc_warned
+    fi
+  done < <(find "$d" -maxdepth 2 -name '*.json' -size +0c 2>/dev/null)
+done
+[[ "$json_errors" -eq 0 ]] && [[ "$config_ok" -eq 1 ]] && ok "all checked configs: valid"
+
+# ─── 7. Package dependency integrity ─────────────────────────────────
+step "package dependencies"
+dep_out=$(pacman -Dk 2>&1 | grep -Ev "^$|No database errors" || true)
+if [[ -n "$dep_out" ]]; then
+  warn "broken dependencies detected:"
+  echo "$dep_out" | head -10 | sed 's/^/  /'
+  log "fix with: sudo pacman -Syu"
+  inc_warned
+else
+  ok "all package dependencies satisfied"
+fi
+
+# ─── 8. Unmerged .pacnew files ────────────────────────────────────────
+step ".pacnew files (updated configs needing merge)"
+mapfile -t pacnew < <(find /etc -name '*.pacnew' 2>/dev/null)
+if (( ${#pacnew[@]} > 0 )); then
+  warn "${#pacnew[@]} config(s) were updated by pacman and need merging:"
+  printf '  %s\n' "${pacnew[@]}"
+  command -v pacdiff >/dev/null && log "merge interactively: sudo DIFFPROG=nvim pacdiff"
+  inc_warned
+else
+  ok "no unmerged .pacnew files"
+fi
+
+# ─── 9. Glassy suite: targeted checks ────────────────────────────────
+step "glassy suite"
+GLASSY_SVCS=("elephant" "walker" "glassy-secure")
+for svc in "${GLASSY_SVCS[@]}"; do
+  svc_file="$HOME/.config/systemd/user/${svc}.service"
+  [[ -f "$svc_file" ]] || continue
+
+  if ! systemctl --user is-enabled "${svc}.service" >/dev/null 2>&1; then
+    continue  # not enabled — skip
+  fi
+
+  state=$(systemctl --user is-active "${svc}.service" 2>/dev/null || echo "inactive")
+  if [[ "$state" == "active" ]]; then
+    ok "$svc: running"
+    continue
+  fi
+
+  # Check why it's down: recent journal errors
+  recent_err=$(journalctl --user -u "${svc}.service" --since="10 minutes ago" \
+               --no-pager -q 2>/dev/null | grep -i "error\|fail\|abort" | tail -2 || true)
+
+  warn "$svc is $state"
+  if [[ -n "$recent_err" ]]; then
+    log "recent errors:"
+    echo "$recent_err" | sed 's/^/  /'
+  fi
+
+  run "systemctl --user start '${svc}.service'"
+  if [[ "$DRY" -eq 0 ]]; then
+    sleep 1
+    new=$(systemctl --user is-active "${svc}.service" 2>/dev/null || echo "inactive")
+    if [[ "$new" == "active" ]]; then
+      fixed "started $svc"
+      inc_fixed
+    else
+      err "$svc could not be started — check: journalctl --user -u ${svc}.service"
+      inc_warned
+    fi
+  fi
+done
+
+# ─── 10. Glassy quarantine: inform if items pending ──────────────────
+Q_DIR="$HOME/.local/share/glassy/quarantine"
+if [[ -d "$Q_DIR" ]]; then
+  q_count=$(find "$Q_DIR" -maxdepth 1 ! -path "$Q_DIR" ! -name 'quarantine.log' 2>/dev/null | wc -l)
+  if (( q_count > 0 )); then
+    warn "$q_count item(s) in quarantine — review: glassy-checkup --quarantine"
+    inc_warned
+  fi
+fi
+
+# ─── Summary ──────────────────────────────────────────────────────────
+echo
+if (( FIXED > 0 && WARNED > 0 )); then
+  ok "done — fixed $FIXED issue(s), $WARNED warning(s) need your attention"
+elif (( FIXED > 0 )); then
+  ok "done — fixed $FIXED issue(s), everything else looks good"
+elif (( WARNED > 0 )); then
+  ok "done — system healthy, $WARNED item(s) need your attention"
+else
+  ok "system is healthy — nothing to fix"
+fi
+
+[[ "$DRY" -eq 1 ]] && log "(dry-run — no changes were made)"

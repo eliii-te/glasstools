@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""glassy-splash — glassyOS animated GOS logo
+Shown at Hyprland startup. Add to Startup_Apps.conf:
+  exec-once = glassy-splash
+"""
+
+import sys
+
+try:
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gtk, Gdk, GLib
+except (ImportError, ValueError):
+    sys.exit(0)
+
+CSS = b"""
+window {
+    background-color: #05050e;
+}
+
+/* Jeder Buchstabe startet unsichtbar */
+.gos-letter {
+    font-family: "Inter", "Cantarell", "DejaVu Sans", sans-serif;
+    font-size: 140px;
+    font-weight: 800;
+    color: rgba(210, 222, 255, 0.95);
+    opacity: 0;
+    transition: opacity 500ms ease-out;
+}
+.gos-letter.visible {
+    opacity: 1;
+}
+.gos-letter.gone {
+    opacity: 0;
+    transition: opacity 600ms ease-in;
+}
+
+/* Linie unter den Buchstaben */
+.gos-line {
+    background-color: rgba(80, 110, 200, 0.0);
+    min-height: 2px;
+    min-width: 0px;
+    margin-top: 16px;
+    transition: background-color 400ms ease-out, min-width 700ms ease-out;
+}
+.gos-line.visible {
+    background-color: rgba(80, 110, 200, 0.6);
+    min-width: 420px;
+}
+.gos-line.gone {
+    background-color: rgba(80, 110, 200, 0.0);
+    min-width: 0px;
+    transition: background-color 400ms ease-in, min-width 400ms ease-in;
+}
+"""
+
+# Timing (ms)
+T_G    = 150   # G erscheint
+T_O    = 350   # O erscheint
+T_S    = 550   # S erscheint
+T_LINE = 750   # Linie fährt ein
+T_OUT  = 1900  # Alles ausblenden
+T_QUIT = 2700  # Fenster schließt
+
+
+class SplashApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.glassyos.splash")
+        self.connect("activate", self._activate)
+        self._letters: list = []
+        self._line = None
+
+    def _activate(self, _app):
+        win = Gtk.ApplicationWindow(application=self)
+        win.set_title("glassyOS")
+        win.set_decorated(False)
+        win.fullscreen()
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_halign(Gtk.Align.CENTER)
+        root.set_valign(Gtk.Align.CENTER)
+
+        # G · O · S als einzelne Labels für sequentielles Einblenden
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        hbox.set_halign(Gtk.Align.CENTER)
+        for ch in "GOS":
+            lbl = Gtk.Label(label=ch)
+            lbl.add_css_class("gos-letter")
+            hbox.append(lbl)
+            self._letters.append(lbl)
+        root.append(hbox)
+
+        # Horizontale Akzentlinie
+        line = Gtk.Box()
+        line.add_css_class("gos-line")
+        line.set_halign(Gtk.Align.CENTER)
+        root.append(line)
+        self._line = line
+
+        win.set_child(root)
+        win.present()
+
+        # Animationssequenz
+        GLib.timeout_add(T_G,    self._show_letter, 0)
+        GLib.timeout_add(T_O,    self._show_letter, 1)
+        GLib.timeout_add(T_S,    self._show_letter, 2)
+        GLib.timeout_add(T_LINE, self._show_line)
+        GLib.timeout_add(T_OUT,  self._hide_all)
+        GLib.timeout_add(T_QUIT, self.quit)
+
+    def _show_letter(self, idx: int) -> bool:
+        lbl = self._letters[idx]
+        lbl.remove_css_class("gone")
+        lbl.add_css_class("visible")
+        return False
+
+    def _show_line(self) -> bool:
+        if self._line:
+            self._line.remove_css_class("gone")
+            self._line.add_css_class("visible")
+        return False
+
+    def _hide_all(self) -> bool:
+        for lbl in self._letters:
+            lbl.remove_css_class("visible")
+            lbl.add_css_class("gone")
+        if self._line:
+            self._line.remove_css_class("visible")
+            self._line.add_css_class("gone")
+        return False
+
+
+SplashApp().run(None)
